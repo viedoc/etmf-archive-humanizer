@@ -13,15 +13,12 @@ Your original `.zip` is **never changed** — the tool only creates a new, easy-
 
 ## What you need
 
-> ⚠️ **You must use PowerShell 7 — *not* the “Windows PowerShell” that comes with Windows.**
-> The built-in “Windows PowerShell” is version **5.1**, and it will refuse to run this tool with an
-> error like *“…requires…PowerShell 7.0…currently running…5.1”*. That is expected — it simply
-> means you opened the wrong one. Installing and using **PowerShell 7** (steps below) is the fix.
+> ✅ **No install needed.** Windows already includes **Windows PowerShell**, and this tool runs on
+> it as-is. If you happen to have the newer **PowerShell 7**, that works too — but you don’t need it.
 
-- **PowerShell 7** — free from Microsoft; runs on Windows, Mac and Linux. This is **not** the
-  “Windows PowerShell” already built into Windows (that older 5.1 version won’t run this tool).
-  Install it with `winget install Microsoft.PowerShell` or from Microsoft’s website; you then run
-  it by typing **`pwsh`**.
+- **A Windows PC** — that’s all you need software-wise. Windows 10 and 11 already include
+  **Windows PowerShell**, which is enough to run this tool. *(It also runs on **PowerShell 7**, and
+  on macOS/Linux, if you have those.)*
 - Your **eTMF export `.zip`** from Viedoc.
 
 Nothing else to install.
@@ -32,11 +29,9 @@ Nothing else to install.
    folder inside Downloads. Keeping them together is the simplest setup: you can then refer to
    each file by just its name.
 
-2. Open **PowerShell 7** — this is the app you need, **not** “Windows PowerShell” (that’s the old
-   5.1). Either:
-   - **Start menu:** click **Start**, type **PowerShell 7**, and open the app of that exact name.
-   - **Windows Terminal:** open **Terminal**, click the small **down-arrow (⌄)** next to the **+**
-     (new-tab) button at the top, and choose **PowerShell 7**.
+2. Open **PowerShell**: click **Start**, type **PowerShell**, and open **Windows PowerShell** (the
+   one built into Windows — that’s all you need). *(Windows Terminal, or **PowerShell 7** if you’ve
+   installed it, work just as well.)*
 
 3. Go to the folder where you put your files. A fresh PowerShell window starts in your personal
    folder (e.g. `C:\Users\You`), so move to your folder with the `cd` command (“change directory”):
@@ -53,7 +48,7 @@ Nothing else to install.
    simply means “in this folder”:
 
    ```powershell
-   pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath ".\My Study eTMF.zip"
+   powershell -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath ".\My Study eTMF.zip"
    ```
 
    Replace `My Study eTMF.zip` with your file’s real name. **Tip:** instead of typing the name,
@@ -65,10 +60,9 @@ Nothing else to install.
    > drag the file in, which always fills the full path). Likewise, if you didn’t `cd` into the
    > script’s folder, put the script’s full path after `-File`.
 
-   The two extra words at the start get you past Windows’ safety checks (details in
-   **[If Windows won’t run it](#if-windows-wont-run-it)** below): `pwsh` runs it with
-   **PowerShell 7**, and `-ExecutionPolicy Bypass` lets this one unsigned script run this one
-   time — it changes nothing on your computer.
+   The **`-ExecutionPolicy Bypass`** part lets this one unsigned script run this one time — it
+   changes nothing on your computer (more in **[If Windows won’t run it](#if-windows-wont-run-it)**
+   below). *(Have PowerShell 7? You can write `pwsh` instead of `powershell`.)*
 
 5. When it finishes, it tells you the name of the new folder it created. Open that folder and
    **double-click `index.html`** to start browsing. *(Add `-Open` to the end of the command to
@@ -78,24 +72,21 @@ If you run the tool **without** giving it a `.zip`, it simply prints these instr
 
 ## If Windows won’t run it
 
-Windows is cautious about scripts it didn’t create. The command in step 4 is built to avoid the
-two common blocks — but if you ever see one of these errors, here’s what it means and why the
-command fixes it:
-
-- **“… requires … PowerShell 7.0 … currently running … 5.1”**
-  You launched the *old* PowerShell. The **first word** of the command picks the version:
-  **`pwsh`** = PowerShell 7 (what you want); **`powershell`** = the old 5.1 built into Windows.
-  Make sure your command starts with `pwsh`. *(If Windows replies that `pwsh` isn’t found, then
-  PowerShell 7 isn’t installed — see [What you need](#what-you-need).)*
+Windows is cautious about scripts it didn’t create. The command in step 4 avoids the common block,
+but if you ever see one of these, here’s what it means:
 
 - **“… cannot be loaded … is not digitally signed”**
-  Windows is blocking a script it didn’t create. The **`-ExecutionPolicy Bypass`** part allows
-  this one script for this one run only; nothing on your computer is changed permanently.
+  Windows is blocking a script it didn’t create. The **`-ExecutionPolicy Bypass`** in the command
+  above allows this one script for this one run only; nothing on your computer is changed permanently.
 
 - **Still blocked even with the full command?** Your organisation may enforce a stricter rule
   (via Group Policy) that overrides `-ExecutionPolicy Bypass`. Ask your IT department — they can
   provide a **digitally signed** copy that runs without any of this (see
   [Technical notes](#technical-notes-for-it)).
+
+- **“… requires … PowerShell 5.1 …”** *(rare)* — your PowerShell is older than the version built
+  into Windows 10/11. Update Windows, or install **PowerShell 7**
+  (`winget install Microsoft.PowerShell`) and run the command with `pwsh` instead of `powershell`.
 
 ## What you get
 
@@ -141,11 +132,14 @@ For full help, run: `Get-Help .\Convert-EtmfArchive.ps1 -Full`
 
 ## Technical notes (for IT)
 
-- **Requires PowerShell 7.0+** (`#requires -Version 7.0`); no external modules to install.
-- **Launching on Windows / execution policy.** Start it with `pwsh` (PowerShell 7 — *not* the
-  built-in `powershell`, which is 5.1). The published script is **unsigned**, so on machines that
-  block unsigned scripts add `-ExecutionPolicy Bypass` (process-scoped — it makes no persistent
-  change): `pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "…zip"`.
+- **Runs on PowerShell 5.1+** (`#requires -Version 5.1`) — both the **Windows PowerShell 5.1** built
+  into Windows 10/11 and **PowerShell 7**. No external modules to install. PowerShell 7 is the
+  primary-tested target; 5.1 is supported (the script uses no 7-only syntax, and hardens the XML
+  parser against XXE, which .NET Framework does not do by default).
+- **Launching / execution policy.** Start it with `powershell` (built-in) or `pwsh` (PowerShell 7).
+  The published script is **unsigned**, so on machines that block unsigned scripts add
+  `-ExecutionPolicy Bypass` (process-scoped — no persistent change):
+  `powershell -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "…zip"`.
 - **Code signing (managed machines).** Where Group Policy enforces `AllSigned`,
   `-ExecutionPolicy Bypass` is *ignored*; sign the script with your organisation’s code-signing
   certificate as the **final** step (re-signing after any rebuild, which regenerates the file):

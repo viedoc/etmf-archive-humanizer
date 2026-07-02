@@ -6,7 +6,7 @@
 
 # ============================================================================
 
-#requires -Version 7.0
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Turns a Viedoc eTMF-EMS archive (.zip or extracted folder) into a human-friendly
@@ -56,9 +56,9 @@
     .\Convert-EtmfArchive.ps1 -ArchivePath ".\archive" -Force -Open
 
 .NOTES
-    Windows: launch with PowerShell 7 (pwsh), NOT the built-in Windows PowerShell 5.1. If the
+    Runs on Windows PowerShell 5.1 (built into Windows 10/11) or PowerShell 7 (pwsh). If the
     script is blocked as "not digitally signed", add -ExecutionPolicy Bypass (this one run only):
-        pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...zip"
+        powershell -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...zip"
 
     Spec: eTMF Exchange Mechanism Standard v1.0 (public domain, TMF Reference Model).
     Integrity values are base64-encoded MD5 (CHKSUMSTD omitted by Viedoc; verified empirically).
@@ -89,6 +89,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# --- Windows PowerShell 5.1 compatibility -----------------------------------------------
+# 5.1 predates the $IsWindows/$IsMacOS/$IsLinux automatic variables. Define them (as Windows,
+# since Windows PowerShell only runs there) so the strict-mode references in the -Open path
+# don't throw. On PowerShell 7 these already exist as read-only automatics, so we leave them.
+if (-not (Test-Path Variable:IsWindows)) {
+    Set-Variable IsWindows -Value $true
+    Set-Variable IsMacOS   -Value $false
+    Set-Variable IsLinux   -Value $false
+}
 
 # ----------------------------------------------------------------------------------------
 #  Constants
@@ -320,6 +330,10 @@ function Import-EtmfManifest {
     param([System.IO.FileInfo]$ManifestFile)
 
     $xml = New-Object System.Xml.XmlDocument
+    # Untrusted manifest: disable DTD / external-entity resolution so a malicious manifest can't
+    # mount an XXE attack. .NET Core (PowerShell 7) already defaults to this; .NET Framework
+    # (Windows PowerShell 5.1) does NOT, so setting it explicitly is required for a safe 5.1 run.
+    $xml.XmlResolver = $null
     $xml.Load($ManifestFile.FullName)
     $batchEl = $xml.DocumentElement
     if ($batchEl.LocalName -ne 'BATCH') {
@@ -763,9 +777,9 @@ function Show-Usage {
     Write-Host '      .\Convert-EtmfArchive.ps1 -ArchivePath "...your.zip" -Open' -ForegroundColor $gr
     Write-Host ""
     Write-Host "  On a locked-down PC, or sharing this with a colleague?  This longer" -ForegroundColor $g
-    Write-Host "  form starts on any Windows machine: it forces PowerShell 7 and lets" -ForegroundColor $g
-    Write-Host "  this one script run even if Windows would otherwise block it:" -ForegroundColor $g
-    Write-Host '      pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...your.zip"' -ForegroundColor $gr
+    Write-Host "  form starts on any Windows machine and lets this one script run" -ForegroundColor $g
+    Write-Host "  even if Windows would otherwise block it as unsigned:" -ForegroundColor $g
+    Write-Host '      powershell -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...your.zip"' -ForegroundColor $gr
     Write-Host ""
     Write-Host "  For all options, run:  Get-Help .\Convert-EtmfArchive.ps1 -Full" -ForegroundColor $g
     Write-Host "  ===================================================================" -ForegroundColor $c
