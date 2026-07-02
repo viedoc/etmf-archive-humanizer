@@ -56,6 +56,10 @@
     .\Convert-EtmfArchive.ps1 -ArchivePath ".\archive" -Force -Open
 
 .NOTES
+    Windows: launch with PowerShell 7 (pwsh), NOT the built-in Windows PowerShell 5.1. If the
+    script is blocked as "not digitally signed", add -ExecutionPolicy Bypass (this one run only):
+        pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...zip"
+
     Spec: eTMF Exchange Mechanism Standard v1.0 (public domain, TMF Reference Model).
     Integrity values are base64-encoded MD5 (CHKSUMSTD omitted by Viedoc; verified empirically).
 #>
@@ -743,9 +747,12 @@ function Show-Usage {
     Write-Host ""
     Write-Host "  HOW TO USE IT" -ForegroundColor $w
     Write-Host "  -------------" -ForegroundColor $w
-    Write-Host "  Run the tool and point it at your .zip file, for example:" -ForegroundColor $g
+    Write-Host "  Keep this script and your .zip in the same folder, and make sure" -ForegroundColor $g
+    Write-Host "  this window is IN that folder (use  cd ""C:\path\to\folder""  to" -ForegroundColor $g
+    Write-Host "  move there - the prompt shows your current folder).  Then point" -ForegroundColor $g
+    Write-Host "  the tool at your .zip, for example:" -ForegroundColor $g
     Write-Host ""
-    Write-Host '      .\Convert-EtmfArchive.ps1 -ArchivePath "C:\Downloads\My Study eTMF.zip"' -ForegroundColor $gr
+    Write-Host '      .\Convert-EtmfArchive.ps1 -ArchivePath ".\My Study eTMF.zip"' -ForegroundColor $gr
     Write-Host ""
     Write-Host "  Tip: you can drag your .zip file into this window to fill in the path." -ForegroundColor $g
     Write-Host ""
@@ -754,6 +761,11 @@ function Show-Usage {
     Write-Host ""
     Write-Host "  Add -Open to open it for you automatically:" -ForegroundColor $g
     Write-Host '      .\Convert-EtmfArchive.ps1 -ArchivePath "...your.zip" -Open' -ForegroundColor $gr
+    Write-Host ""
+    Write-Host "  On a locked-down PC, or sharing this with a colleague?  This longer" -ForegroundColor $g
+    Write-Host "  form starts on any Windows machine: it forces PowerShell 7 and lets" -ForegroundColor $g
+    Write-Host "  this one script run even if Windows would otherwise block it:" -ForegroundColor $g
+    Write-Host '      pwsh -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath "...your.zip"' -ForegroundColor $gr
     Write-Host ""
     Write-Host "  For all options, run:  Get-Help .\Convert-EtmfArchive.ps1 -Full" -ForegroundColor $g
     Write-Host "  ===================================================================" -ForegroundColor $c
