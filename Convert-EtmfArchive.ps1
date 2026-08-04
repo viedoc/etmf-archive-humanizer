@@ -120,6 +120,10 @@ function Write-Log {
         [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP')]
         [string]$Level = 'INFO'
     )
+    # Messages can quote untrusted text (zip entry names, manifest FILENAME). One line per entry
+    # is the log's whole structure, so a name carrying CR/LF could forge convincing "[OK]" lines
+    # in the audit record - strip control characters before the message is ever recorded.
+    $Message = $Message -replace '[\x00-\x1F]', '?'
     $stamp = (Get-Date).ToString('HH:mm:ss')
     $script:LogLines.Add("$stamp [$Level] $Message")
     $color = switch ($Level) {
@@ -169,18 +173,53 @@ function Get-NodeText {
     return $child.InnerText.Trim()
 }
 
+# Split an archive-relative path into its segments: both separators, empties and "." removed.
+# ONE rule, shared by the extractor (Expand-EtmfZip) and the lookup (Resolve-ContentPath). If the
+# two ever normalise differently, a document that IS on disk gets reported as a missing source
+# file - so keep this the single definition and never inline a variant of it.
+function Get-ContentPathSegments {
+    param([string]$Path)
+    # Callers MUST wrap the call in @(): a function return unrolls, so a single-segment result
+    # would arrive as a bare string and $parts.Count would throw under Set-StrictMode. (Do not
+    # "fix" that with a ",@(...)" return here - combined with the caller's @() it nests instead.)
+    return @($Path -split '[\\/]+' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+}
+
+# The archive path a CONTENTURL points at, verbatim ('/'-joined, leading zip-name segment
+# dropped). This is the record's identity and the key into the extraction index, so it is kept
+# RAW: any normalisation here would be a lossy derivation, and deriving identity is exactly what
+# put one document's bytes under another document's record in earlier designs.
+function Get-ContentUrlTail {
+    param([string]$ContentUrl)
+    $segments = $ContentUrl -split '/'
+    if ($segments.Count -lt 2) { return $null }
+    $parts = @(Get-ContentPathSegments (($segments | Select-Object -Skip 1) -join '/'))
+    if ($parts.Count -eq 0 -or ($parts -contains '..')) { return $null }
+    return ($parts -join '/')
+}
+
 # Map an EMS CONTENTURL to an on-disk path. CONTENTURL is "<zipname>.zip/<TransferID>/...";
 # strip the leading zip-name segment and resolve the remainder beside the manifest.
 # SECURITY: the manifest is untrusted, so the resolved path is canonicalized and must stay
 # CONTAINED under $ManifestDir. A traversal ("../") or rooted CONTENTURL returns $null
 # (the referenced file is then recorded as a gap, never read or copied).
+# FOLDER INPUT ONLY. Zip input never comes here: it resolves through the extraction index, which
+# is exact. -SanitizeSegments matches a folder a user pre-extracted with 7-Zip or Explorer, which
+# substitute "_" for the forbidden characters; that substitution is many-to-one, so its caller
+# must confirm the match by checksum before binding.
 function Resolve-ContentPath {
-    param([string]$ContentUrl, [string]$ManifestDir)
+    param([string]$ContentUrl, [string]$ManifestDir, [switch]$SanitizeSegments)
     $segments = $ContentUrl -split '/'
     if ($segments.Count -lt 2) { return $null }
-    $rel = ($segments | Select-Object -Skip 1) -join [IO.Path]::DirectorySeparatorChar
+    $parts = @(Get-ContentPathSegments (($segments | Select-Object -Skip 1) -join '/'))
+    if ($parts.Count -eq 0) { return $null }
+    if ($parts -contains '..') { return $null }                        # traversal -> reject
+    if ($SanitizeSegments) { $parts = @($parts | ForEach-Object { ConvertTo-SafeName $_ }) }
+    $rel  = $parts -join [IO.Path]::DirectorySeparatorChar
     $base = [IO.Path]::GetFullPath($ManifestDir)
-    $full = [IO.Path]::GetFullPath((Join-Path $base $rel))
+    # .NET Framework (5.1) throws on "*?<>|" in a path; treat that as unresolvable, not fatal.
+    try   { $full = [IO.Path]::GetFullPath((Join-Path $base $rel)) }
+    catch { return $null }
     $sep  = [IO.Path]::DirectorySeparatorChar
     $baseWithSep = if ($base.EndsWith($sep)) { $base } else { $base + $sep }
     if (-not $full.StartsWith($baseWithSep, [System.StringComparison]::Ordinal)) { return $null }  # escapes -> reject
@@ -287,6 +326,93 @@ function Get-EtmfStatusToken {
 # ----------------------------------------------------------------------------------------
 #  Input resolution: accept a .zip (extract to temp) or an already-extracted folder.
 # ----------------------------------------------------------------------------------------
+
+# Extract a .zip entry by entry instead of via ZipFile::ExtractToDirectory, and give every
+# content file a NEUTRAL name (00001.bin, 00002.bin, ...) in a flat temp folder.
+#
+# The temp tree is deleted at the end of the run and no user ever sees it, so it does not need
+# readable names - and the moment we stop deriving temp paths from the archive's own text, a
+# whole class of defects disappears rather than having to be defended against:
+#   * "Illegal characters in path." on Windows PowerShell 5.1 - the reported bug. .NET Framework
+#     rejects " < > | * ? and control chars in a path; we no longer put archive text in a path.
+#   * Name collisions - sanitizing is many-to-one, so two documents could land on one file and
+#     one document's bytes could be published under the other's identity. Index names are unique.
+#   * Zip-slip ("../" entries) - the destination never comes from the entry, so it cannot escape.
+#   * MAX_PATH - temp paths are now short regardless of how deep the archive nests.
+# Identity is therefore never derived: Files maps the entry's VERBATIM archive path to the file
+# we wrote, and Import-EtmfManifest looks each CONTENTURL up by exact key.
+# Manifests are the one exception - they keep their (sanitized) name because the recap and the
+# viewer display it. A single unextractable entry is logged and skipped, so it shows up as a
+# missing-source gap rather than killing the run.
+function Expand-EtmfZip {
+    param([string]$ZipPath, [string]$Destination)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    # ORDINAL: keys are raw entry paths, where two spellings differing only in case are two
+    # different documents. The value is the temp file; '' marks an ambiguous key (see below).
+    $files     = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
+    $manifests = New-Object 'System.Collections.Generic.List[object]'
+    $skipped = 0; $count = 0
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }        # directory entry
+            $parts = @(Get-ContentPathSegments $entry.FullName)
+            if ($parts.Count -eq 0) { continue }
+            $rawRel = $parts -join '/'
+            $count++
+
+            $isManifest = $entry.Name -like '*exchange.xml'
+            if ($isManifest) {
+                # Keep a readable name: it is shown in the recap and the viewer. Sanitized because
+                # this one IS a real filename, and de-duplicated because two events could share it.
+                $leaf = ConvertTo-SafeName $entry.Name
+                $dest = Join-Path $Destination $leaf
+                $n = 2
+                while (Test-Path -LiteralPath $dest) {
+                    $dest = Join-Path $Destination ('{0} ({1}){2}' -f [IO.Path]::GetFileNameWithoutExtension($leaf), $n, [IO.Path]::GetExtension($leaf))
+                    $n++
+                }
+            }
+            else {
+                $dest = Join-Path $Destination ('{0:d5}.bin' -f $count)
+            }
+
+            try {
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+            }
+            catch {
+                Write-Log "Could not extract '$($entry.FullName)': $($_.Exception.Message)" 'WARN'
+                $skipped++; continue
+            }
+
+            if ($isManifest) {
+                # Prefix = where this manifest sits in the archive. A CONTENTURL is relative to it,
+                # so prefix + tail reconstructs the entry path exactly.
+                $prefix = ''
+                if ($parts.Count -gt 1) { $prefix = (@($parts[0..($parts.Count - 2)]) -join '/') }
+                $manifests.Add([pscustomobject]@{ Path = $dest; Prefix = $prefix })
+                continue
+            }
+
+            if ($files.ContainsKey($rawRel)) {
+                # Two entries with the identical archive path: nothing can tell which one a
+                # CONTENTURL means, so refuse both rather than guess (both become visible gaps).
+                Write-Log "Ambiguous archive: more than one entry is named '$rawRel' - neither will be matched to a manifest record." 'WARN'
+                $files[$rawRel] = ''
+            }
+            else { $files[$rawRel] = $dest }
+        }
+    }
+    finally { $zip.Dispose() }
+
+    if ($skipped -gt 0) {
+        Write-Log "$skipped zip entr(ies) could not be extracted - they will show as missing source files." 'WARN'
+    }
+    return [pscustomobject]@{ FileCount = $files.Count; Skipped = $skipped; Files = $files; Manifests = $manifests }
+}
+
 function Resolve-EtmfSource {
     param([string]$ArchivePath)
 
@@ -297,16 +423,20 @@ function Resolve-EtmfSource {
 
     if ($item.PSIsContainer) {
         Write-Log "Using extracted archive folder: $($item.FullName)" 'INFO'
-        return [pscustomobject]@{ Root = $item.FullName; TempDir = $null; IsTemp = $false }
+        # No index: we extracted nothing, so the lookup resolves names against the folder itself.
+        return [pscustomobject]@{ Root = $item.FullName; TempDir = $null; IsTemp = $false; ContentMap = $null; Manifests = $null }
     }
 
     if ($item.Extension -ieq '.zip') {
         $temp = Join-Path ([IO.Path]::GetTempPath()) ("etmf_" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
         New-Item -ItemType Directory -Path $temp -Force | Out-Null
-        Write-Log "Extracting archive to temp: $temp" 'STEP'
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($item.FullName, $temp)
-        return [pscustomobject]@{ Root = $temp; TempDir = $temp; IsTemp = $true }
+        $script:TempDir = $temp        # recorded now so the finally in main.ps1 can clean up
+        Write-Log "Extracting archive to temp: $temp" 'STEP'                # even if extraction throws
+        $x = Expand-EtmfZip -ZipPath $item.FullName -Destination $temp
+        Write-Log "Extracted $($x.FileCount) file(s)" 'INFO'
+        # Manifests come from the extractor, not from a directory scan: their temp names are
+        # neutral, and each carries the archive prefix its CONTENTURLs are relative to.
+        return [pscustomobject]@{ Root = $temp; TempDir = $temp; IsTemp = $true; ContentMap = $x.Files; Manifests = $x.Manifests }
     }
 
     throw "ArchivePath must be a .zip file or a folder. Got: $($item.FullName)"
@@ -327,7 +457,10 @@ function Find-ExchangeManifests {
 #  Manifest parsing -> object model
 # ----------------------------------------------------------------------------------------
 function Import-EtmfManifest {
-    param([System.IO.FileInfo]$ManifestFile)
+    # -ContentMap: raw archive path -> extracted temp file, from Expand-EtmfZip ($null for folder
+    # input). -ContentPrefix: where this manifest sits in the archive, since a CONTENTURL is
+    # relative to the manifest but the index is keyed from the archive root.
+    param([System.IO.FileInfo]$ManifestFile, $ContentMap = $null, [string]$ContentPrefix = "")
 
     $xml = New-Object System.Xml.XmlDocument
     # Untrusted manifest: disable DTD / external-entity resolution so a malicious manifest can't
@@ -421,8 +554,46 @@ function Import-EtmfManifest {
             }
             $signatures = @($signatures)
 
-            $diskPath = Resolve-ContentPath $contentUrl $manifestDir
-            $exists   = ($null -ne $diskPath) -and (Test-Path -LiteralPath $diskPath)
+            $integrity = Get-NodeText $file 'INTEGRITY'
+            $diskPath  = $null
+            $exists    = $false
+
+            if ($null -ne $ContentMap) {
+                # Zip input: we extracted this archive, so the index knows exactly which file this
+                # record is. The key is the entry's VERBATIM archive path, so nothing is derived -
+                # there is nothing to collide and no guess to make. Missing key, or '' (an
+                # ambiguous archive), means the document is honestly recorded as a gap.
+                $tail = Get-ContentUrlTail $contentUrl
+                if ($null -ne $tail) {
+                    $key = $tail
+                    if ($ContentPrefix) { $key = $ContentPrefix + '/' + $tail }
+                    $mapped = $null
+                    if ($ContentMap.TryGetValue($key, [ref]$mapped) -and
+                        -not [string]::IsNullOrEmpty($mapped) -and (Test-Path -LiteralPath $mapped -PathType Leaf)) {
+                        $diskPath = $mapped; $exists = $true
+                    }
+                }
+            }
+            else {
+                # Folder input: resolve against the folder the user handed us.
+                $diskPath = Resolve-ContentPath $contentUrl $manifestDir
+                $exists   = ($null -ne $diskPath) -and (Test-Path -LiteralPath $diskPath -PathType Leaf)
+                if (-not $exists) {
+                    # 7-Zip and Explorer substitute "_" for the characters Windows forbids, but that
+                    # substitution is many-to-one and we have no index to disambiguate it. Bind only
+                    # if the bytes are the ones the manifest asked for - checked even under
+                    # -SkipIntegrityCheck, because a wrong match here is what stays silent.
+                    $alt = Resolve-ContentPath $contentUrl $manifestDir -SanitizeSegments
+                    if (($null -ne $alt) -and (Test-Path -LiteralPath $alt -PathType Leaf)) {
+                        if ($integrity -and ((Get-FileMd5Base64 $alt) -ceq $integrity)) {
+                            $diskPath = $alt; $exists = $true
+                        }
+                        else {
+                            Write-Log ("Ignored a sanitized-name match for '{0}': its content does not match the manifest checksum, so it is recorded as a gap rather than risk the wrong document." -f (Get-NodeText $file 'FILENAME')) 'WARN'
+                        }
+                    }
+                }
+            }
 
             $documents.Add([pscustomobject]@{
                 ArtifactNumber = $artifactNumber
@@ -451,7 +622,7 @@ function Import-EtmfManifest {
                 Status         = $status
                 OriginalName   = Get-NodeText $file 'FILENAME'
                 ContentUrl     = $contentUrl
-                Integrity      = Get-NodeText $file 'INTEGRITY'
+                Integrity      = $integrity
                 DiskPath       = $diskPath
                 FileExists     = $exists
                 SizeBytes      = if ($exists) { (Get-Item -LiteralPath $diskPath).Length } else { 0 }
@@ -492,9 +663,14 @@ function Invoke-IntegrityCheck {
 # -MaxLength (when > 0) caps the whole file name, truncating the document-name part to fit.
 function Get-HumanFileName {
     param($Doc, [switch]$KeepOriginal, [int]$MaxLength = 0)
-    $ext = [System.IO.Path]::GetExtension($Doc.OriginalName)
-    if ($KeepOriginal) { return (ConvertTo-SafeName $Doc.OriginalName) }
-    $stem   = [System.IO.Path]::GetFileNameWithoutExtension($Doc.OriginalName)
+    # Sanitize BEFORE any path API sees it: OriginalName is the verbatim manifest <FILENAME>, and
+    # on .NET Framework (5.1) GetExtension/GetFileNameWithoutExtension throw "Illegal characters
+    # in path." for " < > | and control chars - the same crash this tool now handles at extraction.
+    # Doing it here also stops an unsafe extension surviving into the destination via "+ $ext".
+    $safeOriginal = ConvertTo-SafeName $Doc.OriginalName
+    $ext = [System.IO.Path]::GetExtension($safeOriginal)
+    if ($KeepOriginal) { return $safeOriginal }
+    $stem   = [System.IO.Path]::GetFileNameWithoutExtension($safeOriginal)
     $suffix = " v{0} [{1}]" -f $Doc.Version, $Doc.Status
     if ($MaxLength -gt 0) {
         $room = $MaxLength - $suffix.Length - $ext.Length
@@ -553,7 +729,9 @@ function Invoke-Humanize {
             $copyOk = $null
             if ($VerifyCopy) {
                 $copyOk = ((Get-FileMd5Base64 $dest) -ceq $d.Integrity)   # base64 is case-sensitive
-                if (-not $copyOk) { $copyBad++; Write-Log "Copy integrity MISMATCH: $fileName" 'WARN' }
+                # Name the file we actually WROTE: the collision guard above may have suffixed it,
+                # and a QA reviewer reconciling the log against the tree must land on the real one.
+                if (-not $copyOk) { $copyBad++; Write-Log "Copy integrity MISMATCH: $(Split-Path $dest -Leaf)" 'WARN' }
             }
             $copied++
 
@@ -1205,6 +1383,7 @@ footer{max-width:820px;margin:8px auto 30px;padding:0 18px;color:#67727f;font-si
 #  MAIN
 # ========================================================================================
 $script:OutputRoot = $null
+$script:TempDir    = $null      # set as soon as the temp dir exists, so cleanup survives a throw
 $source = $null
 
 # No archive supplied -> show friendly instructions and stop (instead of prompting).
@@ -1223,13 +1402,25 @@ try {
                  } else { $inputItem.DirectoryName }
 
     $source = Resolve-EtmfSource -ArchivePath $ArchivePath
-    $manifests = @(Find-ExchangeManifests -Root $source.Root)
+    # For a zip the extractor already told us where the manifests are (and what archive prefix each
+    # one's CONTENTURLs are relative to); for a folder we go and find them.
+    if ($null -ne $source.Manifests) {
+        $manifests = @($source.Manifests | ForEach-Object {
+            [pscustomobject]@{ File = (Get-Item -LiteralPath $_.Path); Prefix = $_.Prefix }
+        })
+        if ($manifests.Count -eq 0) { throw "No '*exchange.xml' manifest found in: $ArchivePath" }
+    }
+    else {
+        $manifests = @(Find-ExchangeManifests -Root $source.Root |
+            ForEach-Object { [pscustomobject]@{ File = $_; Prefix = '' } })
+    }
     Write-Log ("Found {0} manifest file(s)." -f $manifests.Count) 'OK'
 
     # ---- Phase 4: parse + classify + verify every manifest (one per study event/milestone) ----
-    $events = foreach ($mf in $manifests) {
+    $events = foreach ($m in $manifests) {
+        $mf = $m.File
         Write-Log "Parsing manifest: $($mf.Name)" 'STEP'
-        $model = Import-EtmfManifest -ManifestFile $mf
+        $model = Import-EtmfManifest -ManifestFile $mf -ContentMap $source.ContentMap -ContentPrefix $m.Prefix
         Write-Log ("Parsed {0} document(s) from {1} object(s)." -f $model.Documents.Count, $model.ObjectCount) 'OK'
         $integrity = $null
         if (-not $SkipIntegrityCheck) {
@@ -1347,9 +1538,11 @@ finally {
         $logPath = Join-Path $script:OutputRoot '_log.txt'
         $script:LogLines | Set-Content -LiteralPath $logPath -Encoding UTF8 -ErrorAction SilentlyContinue
     }
-    # Remove the temp extraction (files have been copied out by now).
-    if ($null -ne $source -and $source.IsTemp -and (Test-Path -LiteralPath $source.TempDir)) {
-        Remove-Item -LiteralPath $source.TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    # Remove the temp extraction (files have been copied out by now). Keyed off $script:TempDir,
+    # not $source, so a throw *during* extraction still cleans up rather than leaving clinical
+    # documents behind in the temp folder.
+    if ($script:TempDir -and (Test-Path -LiteralPath $script:TempDir)) {
+        Remove-Item -LiteralPath $script:TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
