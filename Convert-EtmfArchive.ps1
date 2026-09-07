@@ -1,13 +1,4 @@
-﻿# ============================================================================
-
-#  GENERATED FILE - DO NOT EDIT DIRECTLY.
-
-#  Built from src/ by build/Build.ps1. Edit the sources there and rebuild.
-
-# ============================================================================
-
-#requires -Version 5.1
-<#
+﻿<#
 .SYNOPSIS
     Turns a Viedoc eTMF-EMS archive (.zip or extracted folder) into a human-friendly
     rendering: a clean eTMF folder tree that separates Final / In Progress / Superseded
@@ -18,13 +9,20 @@
     and the referenced files, then:
       * parses every OBJECT / FILE / AUDITRECORD / SIGNATURE / METADATA into an object model,
       * classifies each document (per object) by lifecycle (audit events) AND version state,
+      * flags records worth a human look (identical content filed twice; a name that mentions
+        another study's code) and applies the reviewer's own -ExclusionList decisions,
       * copies + renames files into a readable tree, verifying MD5 on every copy,
       * writes inventory.csv, a run log, and a self-contained index.html viewer.
 
     The eTMF tree is the backbone: Zone > Section > Artifact, with the status split made
     *inside* each artifact:  Artifact > <status bucket> > <Country/Site> > files.
-    Multi-milestone exports (more than one manifest) get one subfolder per event plus a
-    landing page. The original archive is never modified.
+    -FinalOnly produces the client-facing counterpart: current approved documents only, with no
+    status subfolders, plus a note recording what was left out.
+    A multi-milestone export (more than one manifest) is MERGED into that one tree, because each
+    milestone export is a full snapshot of the TMF: the same file exported in several milestones
+    is published once (the newest snapshot's record wins) and the milestone is recorded as data,
+    in inventory.csv and in the viewer, instead of as a folder level. Use -SplitByMilestone for
+    the older per-milestone view. The original archive is never modified.
 
 .PARAMETER ArchivePath
     Path to the eTMF archive .zip, OR a folder that already contains the extracted archive
@@ -33,6 +31,25 @@
 .PARAMETER OutputPath
     Destination folder for the humanized output. Defaults to "<input directory>\<StudyName>",
     where the folder name is built from $DefaultOutputNameTemplate near the top of the script.
+
+.PARAMETER FinalOnly
+    Produce a copy containing ONLY the current, approved documents - the version the eTMF records
+    as Current AND finalised or locked - for handing to a client or sponsor. Superseded versions,
+    drafts and anything excluded by -ExclusionList are left out, and the status subfolders are
+    dropped (everything in this copy is final). An "About this folder.txt" states what the copy
+    contains, what was left out and how many of each, so the scope of the handover is on record.
+    This is a convenience copy, NOT the complete trial master file - run without the switch for that.
+
+.PARAMETER ExclusionList
+    Path to a CSV of documents to keep out of the main tree - the reviewer's decisions about
+    documents that do not belong in this TMF (wrongly uploaded, from another study, ...).
+    Columns: DocumentId (required), Version (optional - only that version), Reason (optional).
+    Matching documents are filed under "_Excluded" with the reason recorded; nothing is deleted,
+    and a row that matches no document is reported rather than ignored.
+
+.PARAMETER SplitByMilestone
+    Write one subfolder (and one viewer) per milestone export instead of merging them into a
+    single TMF tree. Only has an effect when the archive holds more than one manifest.
 
 .PARAMETER KeepOriginalNames
     Copy files with their original filenames instead of the readable rename convention.
@@ -63,6 +80,19 @@
     Spec: eTMF Exchange Mechanism Standard v1.0 (public domain, TMF Reference Model).
     Integrity values are base64-encoded MD5 (CHKSUMSTD omitted by Viedoc; verified empirically).
 #>
+
+# ============================================================================
+#  GENERATED FILE - DO NOT EDIT DIRECTLY.
+#  Built from src/ by build/Build.ps1. Edit the sources there and rebuild.
+# ============================================================================
+# NOTE ON THE HELP BLOCK ABOVE - two things silently break `Get-Help -Full`, degrading it to the
+# bare syntax line (the command README.md and .NOTES both tell users to run):
+#   1. ANY free text inside the block before the first .KEYWORD - which is why this banner lives
+#      here and not in there;
+#   2. #requires above it. Above it, PowerShell stops associating the
+# comment-based help with the script and 'Get-Help -Full' degrades to the bare syntax line - which
+# is the command README.md and the .NOTES section both tell users to run.
+#requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Position = 0)]   # optional: with no value, the script prints friendly usage and exits
@@ -70,6 +100,15 @@ param(
 
     [Parameter()]
     [string]$OutputPath,
+
+    [Parameter()]
+    [switch]$FinalOnly,
+
+    [Parameter()]
+    [string]$ExclusionList,
+
+    [Parameter()]
+    [switch]$SplitByMilestone,
 
     [Parameter()]
     [switch]$KeepOriginalNames,
@@ -104,11 +143,17 @@ if (-not (Test-Path Variable:IsWindows)) {
 #  Constants
 # ----------------------------------------------------------------------------------------
 $script:EmsNamespace = 'https://tmfrefmodel.com/ems'
+# Stamped into the run log, the viewer and inventory.csv. A support mail that says "it still fails"
+# is unanswerable without it: we could not tell whether a reported log came from the build that
+# contains a given fix. Bump it with any change to behaviour or output.
+$script:ToolVersion  = '1.1.0'
+$script:RunStamp     = (Get-Date).ToString('yyyyMMdd-HHmmss')   # names the log; one file per run
 $script:LogLines     = [System.Collections.Generic.List[string]]::new()
 
 # Default output folder name when -OutputPath is not supplied. {0} = study name.
 # Edit this to set your house style, e.g. '{0}', '{0} - eTMF', or 'eTMF - {0}'.
-$script:DefaultOutputNameTemplate = '{0}'
+$script:DefaultOutputNameTemplate   = '{0}'
+$script:FinalOnlyOutputNameTemplate = '{0} (final documents only)'
 
 
 # ----------------------------------------------------------------------------------------
@@ -141,6 +186,19 @@ function Write-Log {
         default{ '       ' }
     }
     Write-Host "$prefix$Message" -ForegroundColor $color
+}
+
+# Console AND log, in one call. Everything the operator sees on screen belongs in the run record:
+# the summary tables and the final recap are the most useful part of a run, and for as long as they
+# went only to Write-Host, the log a customer emailed us was missing exactly what they were reading.
+function Write-Out {
+    param([string]$Message = '', [string]$ForegroundColor = 'Gray')
+    foreach ($line in ($Message -split "`r?`n")) {
+        # One line per entry is the log's whole structure; strip the control characters that
+        # manifest-derived text could carry (newlines already handled by the split above).
+        $script:LogLines.Add(($line -replace '[\x00-\x09\x0B\x0C\x0E-\x1F]', '?').TrimEnd())
+    }
+    Write-Host $Message -ForegroundColor $ForegroundColor
 }
 
 
@@ -191,7 +249,10 @@ function Get-ContentPathSegments {
 # put one document's bytes under another document's record in earlier designs.
 function Get-ContentUrlTail {
     param([string]$ContentUrl)
-    $segments = $ContentUrl -split '/'
+    # Both separators: Get-ContentPathSegments and Resolve-ContentPath already accept backslashes,
+    # and splitting on '/' alone made a backslash-separated CONTENTURL report itself as "malformed",
+    # which tells a customer their export is broken when it is merely written the other way round.
+    $segments = $ContentUrl -split '[\\/]+'
     if ($segments.Count -lt 2) { return $null }
     $parts = @(Get-ContentPathSegments (($segments | Select-Object -Skip 1) -join '/'))
     if ($parts.Count -eq 0 -or ($parts -contains '..')) { return $null }
@@ -295,6 +356,59 @@ function Get-ContentPathParts {
 }
 
 
+# Human milestone label for a manifest: "09 Database Lock_exchange.xml" -> "09 Database Lock".
+# The BATCH's EVENTID is Viedoc's internal event id and does NOT match the milestone number shown
+# in the eTMF UI (a reviewer reading "11" for what the study calls milestone 9 cannot reconcile the
+# output against the system) - the milestone's real name is carried by the manifest's file name.
+# Falls back to the event id only when the name carries no label of its own.
+function Get-MilestoneLabel {
+    param([string]$ManifestFileName, [string]$EventId)
+    # The extractor may have appended " (2)" to de-duplicate two identically named manifests.
+    $stem = ([string]$ManifestFileName) -replace '(?i)[_\- ]?exchange(\s*\(\d+\))?\.xml$', ''
+    $stem = $stem.Trim().Trim('_', '-', ' ')
+    if (-not [string]::IsNullOrWhiteSpace($stem)) { return $stem }
+    if (-not [string]::IsNullOrWhiteSpace($EventId)) { return "Event $EventId" }
+    return 'Milestone'
+}
+
+# A document's path INSIDE its milestone snapshot: everything below the TransferID segment.
+# Every milestone export re-exports the same documents under a new TransferID root, so this is the
+# half of the cross-snapshot identity that stays constant (the MD5 is the other half).
+function Get-SnapshotRelativePath {
+    param([string]$ContentUrl, [string]$TransferId)
+    $segs = @($ContentUrl -split '[\\/]+' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+    if ($segs.Count -eq 0) { return '' }
+    $idx = -1
+    if (-not [string]::IsNullOrWhiteSpace($TransferId)) { $idx = [array]::IndexOf($segs, $TransferId) }
+    if ($idx -lt 0) { $idx = 0 }                       # fallback: drop the leading "<name>.zip" segment
+    if (($idx + 1) -ge $segs.Count) { return $segs[$segs.Count - 1] }
+    return (@($segs[($idx + 1)..($segs.Count - 1)]) -join '/')
+}
+
+# Cross-snapshot identity of one document VERSION RECORD.
+#
+# Content alone is NOT identity, and assuming it was cost this tool two critical defects:
+#   * A real Viedoc export records a document's version history as several OBJECTs that share ONE
+#     physical file - same CONTENTURL, same INTEGRITY - differing only in OBJECTVERSION. Keying on
+#     content collapsed v1/v2 into v3 and deleted their audit trails from a regulated archive.
+#   * Import-EtmfManifest already de-dupes CONTENTURL *within* an OBJECT, so any repeat that reaches
+#     the merge is BY CONSTRUCTION a different artifact record - one document filed under two
+#     artifact numbers is an ordinary TMF pattern. Keying on content threw one of them away, with
+#     its title, its audit trail and its e-signature.
+# So the key is the record's full identity plus its content: the same document version, re-exported
+# at a later milestone, still matches on every one of these fields (which is the collapse we DO
+# want), while anything that differs in identity or version stays a separate record.
+# Returns $null when the manifest states no checksum: identity cannot be established, and merging on
+# a guess is the failure mode this whole design exists to prevent.
+function Get-EtmfDocumentKey {
+    param($Doc)
+    if ([string]::IsNullOrWhiteSpace($Doc.Integrity)) { return $null }
+    $rel = Get-SnapshotRelativePath $Doc.ContentUrl $Doc.TransferId
+    if ([string]::IsNullOrWhiteSpace($rel)) { return $null }
+    return (@($Doc.Integrity, $rel, $Doc.DocumentId, $Doc.ArtifactNumber,
+              $Doc.Country, $Doc.SiteId, $Doc.Version) -join '|')
+}
+
 
 # Lifecycle = the furthest stage reached across an object's audit events. Matching is tolerant
 # (substring, case-insensitive) so producer phrasing variants like "Document Finalized" still map.
@@ -320,6 +434,83 @@ function Get-EtmfStatusToken {
     param([string]$VersionState, [string]$Lifecycle)
     if ($VersionState -in @('Superseded', 'Obsolete')) { return $VersionState }
     return $Lifecycle
+}
+
+# ----------------------------------------------------------------------------------------
+#  Version resolution (which version of a document is the current one)
+# ----------------------------------------------------------------------------------------
+
+# The key that ties every VERSION of one Viedoc document together, across snapshots.
+# DocumentId is Viedoc's own document identity; artifact + country + site are a safety net (and
+# the same grouping the viewer's version history already uses). No DocumentId means no identity:
+# return $null and let the record stand alone rather than group on a resemblance.
+function Get-EtmfVersionGroupKey {
+    param($Doc)
+    if ([string]::IsNullOrWhiteSpace($Doc.DocumentId)) { return $null }
+    return ('{0}|{1}|{2}|{3}' -f $Doc.DocumentId, $Doc.ArtifactNumber, $Doc.Country, $Doc.SiteId)
+}
+
+# Compare two OBJECTVERSION values. Dotted numeric versions are compared SEGMENT BY SEGMENT, so
+# v10 beats v9 (a string compare gets that backwards) and v1.10 beats v1.9 (parsing them as decimals
+# gets THAT backwards, and would additionally depend on the machine's decimal separator - which must
+# never decide which version of a clinical document is the current one). Anything else: ordinal.
+function Compare-EtmfVersion {
+    param([string]$A, [string]$B)
+    $sa = @(([string]$A).Trim() -split '\.')
+    $sb = @(([string]$B).Trim() -split '\.')
+    $numeric = $true
+    foreach ($seg in ($sa + $sb)) { if ($seg -notmatch '^\d+$') { $numeric = $false; break } }
+    if ($numeric) {
+        # Compared as DIGIT STRINGS (leading zeros stripped, longer number wins, then ordinal), never
+        # cast to a number: a manifest is untrusted text and an absurdly long version segment would
+        # overflow [int64] and abort the entire conversion over a cosmetic field.
+        $max = [Math]::Max($sa.Count, $sb.Count)
+        for ($i = 0; $i -lt $max; $i++) {
+            $x = if ($i -lt $sa.Count) { ([string]$sa[$i]).TrimStart('0') } else { '' }   # "1.0" equals "1"
+            $y = if ($i -lt $sb.Count) { ([string]$sb[$i]).TrimStart('0') } else { '' }
+            if ($x.Length -ne $y.Length) { if ($x.Length -lt $y.Length) { return -1 } else { return 1 } }
+            $c = [string]::CompareOrdinal($x, $y)
+            if ($c -lt 0) { return -1 }
+            if ($c -gt 0) { return 1 }
+        }
+        return 0
+    }
+    $c = [string]::CompareOrdinal([string]$A, [string]$B)
+    if ($c -lt 0) { return -1 }
+    if ($c -gt 0) { return 1 }
+    return 0
+}
+
+# ----------------------------------------------------------------------------------------
+#  Review heuristics (flag for a human; never decide)
+# ----------------------------------------------------------------------------------------
+
+# Does this text mention a study code that is NOT this study's? Returns the offending token, or ''.
+#
+# Deliberately narrow, because a noisy flag is worse than none: the token must be UPPERCASE letters
+# followed by at least THREE digits (the shape of a study code - "XYZ-002"), which is what keeps
+# ordinary document numbering out of it ("Consent Form-01", "Amendment-001" in mixed case). The
+# study's own code must have that shape too, and text that already names this study is never
+# flagged. Even then this only ever RAISES A FLAG - see Set-EtmfReviewFlags.
+function Get-EtmfForeignStudyCode {
+    param([string]$Text, [string[]]$StudyCodes)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $norm = { param($s) ([string]$s).ToUpperInvariant() -replace '[-_ ]', '' }
+    # Shape-test the study's own id UPPER-CASED: a study registered as "test-001" would otherwise
+    # fail the test and silently switch the whole check off.
+    $own = @($StudyCodes | Where-Object { $_ -and ((& $norm $_) -cmatch '^[A-Z]{2,10}\d{3,6}$') } | ForEach-Object { & $norm $_ })
+    if ($own.Count -eq 0) { return '' }                     # no code-shaped study id -> nothing to compare against
+    $textNorm = & $norm $Text
+    foreach ($c in $own) { if ($textNorm.Contains($c)) { return '' } }   # names this study -> fine
+    # Tokens that look like study codes but never are: standards, quality marks, CVs, dates. Without
+    # this, "ISO 9001" and "CV_2021" in a file name raise a "belongs to another study" flag, and a
+    # heuristic that cries wolf is one nobody reads.
+    $notStudyCodes = @('ISO', 'IEC', 'EN', 'DIN', 'ASTM', 'ICH', 'GCP', 'CFR', 'EU', 'GDPR', 'CV', 'ID', 'NO', 'REF', 'VER', 'V')
+    foreach ($m in [regex]::Matches($Text, '\b([A-Z]{2,10})[-_ ]?\d{3,6}\b')) {
+        if ($notStudyCodes -contains $m.Groups[1].Value) { continue }
+        if ($own -notcontains (& $norm $m.Value)) { return $m.Value }
+    }
+    return ''
 }
 
 
@@ -474,16 +665,29 @@ function Import-EtmfManifest {
     }
     $manifestDir = $ManifestFile.DirectoryName
 
+    $eventId    = $batchEl.GetAttribute('EVENTID')
+    # Trimmed: the TransferID anchors every CONTENTURL lookup and the snapshot-relative path, so a
+    # stray space in the attribute would silently switch the merge to its fallback and stop it
+    # collapsing anything.
+    $transferId = ([string]$batchEl.GetAttribute('TRANSFERID')).Trim()
+    # Milestone name comes from the manifest's FILE NAME, not EVENTID - see Get-MilestoneLabel.
+    $milestone  = Get-MilestoneLabel $ManifestFile.Name $eventId
+
+    # Milestones/IsMerged are present on every batch (a single manifest is a one-milestone merge),
+    # so the humanizer and the viewer never have to branch on how the model was built.
     $batch = [pscustomobject]@{
         StudySystemId   = $batchEl.GetAttribute('STUDYSYSTEMID')
         StudyId         = $batchEl.GetAttribute('STUDYID')
-        EventId         = $batchEl.GetAttribute('EVENTID')
-        TransferId      = $batchEl.GetAttribute('TRANSFERID')
+        EventId         = $eventId
+        TransferId      = $transferId
         TransferSource  = $batchEl.GetAttribute('TRANSFERSOURCEID')
         SpecificationId = $batchEl.GetAttribute('SPECIFICATIONID')
         TmfRmVersion    = $batchEl.GetAttribute('TMFRMVERSION')
         ManifestFile    = $ManifestFile.Name
         ManifestDir     = $manifestDir
+        Milestone       = $milestone
+        Milestones      = @($milestone)
+        IsMerged        = $false
     }
 
     $documents = [System.Collections.Generic.List[object]]::new()
@@ -557,6 +761,11 @@ function Import-EtmfManifest {
             $integrity = Get-NodeText $file 'INTEGRITY'
             $diskPath  = $null
             $exists    = $false
+            # A gap has to explain ITSELF. "Missing source file: X" told a customer nothing, cost a
+            # round of mail asking for the archive, and still left us guessing; these three states
+            # are distinguishable at the point of failure, so record which one it was.
+            $gapReason = ''
+            $lookupKey = ''
 
             if ($null -ne $ContentMap) {
                 # Zip input: we extracted this archive, so the index knows exactly which file this
@@ -564,20 +773,31 @@ function Import-EtmfManifest {
                 # there is nothing to collide and no guess to make. Missing key, or '' (an
                 # ambiguous archive), means the document is honestly recorded as a gap.
                 $tail = Get-ContentUrlTail $contentUrl
-                if ($null -ne $tail) {
+                if ($null -eq $tail) {
+                    $gapReason = 'the CONTENTURL is malformed or points outside the archive'
+                }
+                else {
                     $key = $tail
                     if ($ContentPrefix) { $key = $ContentPrefix + '/' + $tail }
+                    $lookupKey = $key
                     $mapped = $null
-                    if ($ContentMap.TryGetValue($key, [ref]$mapped) -and
-                        -not [string]::IsNullOrEmpty($mapped) -and (Test-Path -LiteralPath $mapped -PathType Leaf)) {
-                        $diskPath = $mapped; $exists = $true
+                    if (-not $ContentMap.TryGetValue($key, [ref]$mapped)) {
+                        $gapReason = 'the archive contains no entry with this exact path'
                     }
+                    elseif ([string]::IsNullOrEmpty($mapped)) {
+                        $gapReason = 'two or more archive entries share this exact path, so neither can be identified'
+                    }
+                    elseif (-not (Test-Path -LiteralPath $mapped -PathType Leaf)) {
+                        $gapReason = 'the archive entry could not be extracted (see the extraction warning above)'
+                    }
+                    else { $diskPath = $mapped; $exists = $true }
                 }
             }
             else {
                 # Folder input: resolve against the folder the user handed us.
-                $diskPath = Resolve-ContentPath $contentUrl $manifestDir
-                $exists   = ($null -ne $diskPath) -and (Test-Path -LiteralPath $diskPath -PathType Leaf)
+                $diskPath  = Resolve-ContentPath $contentUrl $manifestDir
+                $lookupKey = $diskPath
+                $exists    = ($null -ne $diskPath) -and (Test-Path -LiteralPath $diskPath -PathType Leaf)
                 if (-not $exists) {
                     # 7-Zip and Explorer substitute "_" for the characters Windows forbids, but that
                     # substitution is many-to-one and we have no index to disambiguate it. Bind only
@@ -589,13 +809,23 @@ function Import-EtmfManifest {
                             $diskPath = $alt; $exists = $true
                         }
                         else {
+                            $gapReason = 'a file with a sanitized name is present but its content does not match the manifest checksum'
                             Write-Log ("Ignored a sanitized-name match for '{0}': its content does not match the manifest checksum, so it is recorded as a gap rather than risk the wrong document." -f (Get-NodeText $file 'FILENAME')) 'WARN'
                         }
+                    }
+                    elseif ($null -eq $diskPath) {
+                        $gapReason = 'the CONTENTURL does not resolve to a path inside the manifest folder'
+                    }
+                    else {
+                        $gapReason = 'no file exists at this path in the extracted folder'
                     }
                 }
             }
 
             $documents.Add([pscustomobject]@{
+                Milestone      = $milestone
+                AllMilestones  = @($milestone)   # every snapshot this exact file appeared in (merge)
+                TransferId     = $transferId     # anchors this record's CONTENTURL, even once merged
                 ArtifactNumber = $artifactNumber
                 ObjectLevel    = Get-NodeText $obj 'OBJECTLEVEL'
                 Country        = $country
@@ -625,11 +855,18 @@ function Import-EtmfManifest {
                 Integrity      = $integrity
                 DiskPath       = $diskPath
                 FileExists     = $exists
+                GapReason      = $gapReason   # why it could not be bound (empty when it was)
+                LookupKey      = $lookupKey   # the exact path/key we looked for
                 SizeBytes      = if ($exists) { (Get-Item -LiteralPath $diskPath).Length } else { 0 }
                 IntegrityOk    = $null   # filled by integrity pass (source)
                 AuditTrail     = $auditTrail
                 Signatures     = $signatures
                 Metadata       = $metadata
+                SupersededBy   = ''      # filled by Resolve-EtmfVersions when a newer version exists
+                ReviewFlag     = ''      # filled by Set-EtmfReviewFlags (flag only - nothing moves)
+                ReviewReason   = ''
+                Excluded       = $false  # filled by Set-EtmfExclusions from -ExclusionList
+                ExclusionReason = ''
                 NewName        = ''      # filled by Phase 5 (copy/rename)
                 RelPath        = ''      # filled by Phase 5 (path relative to output root)
                 CopyIntegrityOk = $null  # filled by Phase 5 (verify the copy)
@@ -641,6 +878,405 @@ function Import-EtmfManifest {
 }
 
 # ----------------------------------------------------------------------------------------
+#  Merge the per-milestone models into ONE model
+# ----------------------------------------------------------------------------------------
+# A milestone export is a SNAPSHOT of the whole eTMF at that moment, so an archive with 11
+# milestones re-exports the same documents 11 times. Publishing a folder per milestone (what this
+# tool used to do) hands the reader 11 partial TMFs and no way to search across them, so the
+# default is now ONE tree - which means the repeats have to be collapsed, or the copier's collision
+# guard would file the same document as "... (2)", "... (3)", ... eleven times over.
+#
+# Identity is EXACT, never approximate, and it is the record's IDENTITY, not its content:
+# Get-EtmfDocumentKey requires the checksum, the path, DocumentId, artifact, country, site AND
+# OBJECTVERSION to match. Content alone is not identity - a real export gives every version of a
+# document the SAME file and checksum - so collapsing on content deleted version history. Deciding
+# which version supersedes which is then a separate concern (Resolve-EtmfVersions).
+#
+# The record kept is the one from the LATEST snapshot, so the newest milestone's verdict on
+# version state and lifecycle is what the reader sees; the labels of every snapshot the file
+# appeared in are carried along for the inventory.
+function Merge-EtmfEvents {
+    param($Events)
+
+    # Ascending by TransferID (a yyyyMMddHHmmss stamp) so that "last one wins" = newest wins.
+    # The manifest name is a tie-breaker: PowerShell 5.1's Sort-Object is not stable, and a
+    # merge whose winner depends on enumeration order would not be reproducible.
+    $ordered = @($Events | Sort-Object -Property @{ Expression = { [string]$_.Model.Batch.TransferId } },
+                                                 @{ Expression = { [string]$_.Model.Batch.ManifestFile } })
+
+    # ORDINAL: the key carries a base64 checksum and a file path, both case-sensitive. (A plain
+    # [ordered]@{} would compare them case-insensitively.) Insertion order is kept so the merged
+    # model lists documents oldest-snapshot-first rather than in hash order.
+    $byKey = New-Object System.Collections.Specialized.OrderedDictionary ([System.StringComparer]::Ordinal)
+    $collapsed = 0
+    $objectCount = 0
+
+    foreach ($ev in $ordered) {
+        $objectCount += $ev.Model.ObjectCount
+        $label = $ev.Model.Batch.Milestone
+        # Keys already used by THIS manifest. Collapse is a cross-snapshot operation: two records in
+        # one manifest are two records even when every identity field matches, because lifecycle is
+        # derived from their audit events - which no key can contain - so collapsing them let XML
+        # order decide whether a document came out "Finalized / 01 Final" or "In Review".
+        $seenThisEvent = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($d in $ev.Model.Documents) {
+            $key = Get-EtmfDocumentKey $d
+            if ($null -eq $key) {
+                # No checksum to identify it by: keep the record on its own rather than guess.
+                $key = 'unkeyed:' + [Guid]::NewGuid().ToString('N')
+            }
+            elseif ($seenThisEvent.Contains($key)) {
+                $n = 2
+                while ($seenThisEvent.Contains(('{0}#{1}' -f $key, $n))) { $n++ }
+                # Numbered BY ORDER OF APPEARANCE, deliberately: the same suffix is derived in every
+                # snapshot, so a within-manifest duplicate still pairs with its counterpart in the
+                # next export. A GUID here would make each snapshot's copy unique and publish N of
+                # them. Pairing therefore assumes these records keep their order between exports.
+                $key = '{0}#{1}' -f $key, $n
+            }
+            [void]$seenThisEvent.Add($key)
+            if ($byKey.Contains($key)) {
+                $prev = $byKey[$key]
+                $d.AllMilestones = @(@($prev.AllMilestones) + $label | Select-Object -Unique)
+                # "Later wins" must never cost us a FILE. If the newer snapshot lists this record but
+                # its file is absent, unextractable or ambiguous there, while an older snapshot bound
+                # and verified it, carry the binding across: the key contains INTEGRITY, so those
+                # bytes are provably this record's content. Without this, an export defect in the
+                # newest milestone silently deletes a document that IS in the archive - the tool
+                # manufacturing the very "missing source file" symptom it was asked to explain.
+                if ((-not $d.FileExists) -and $prev.FileExists) {
+                    # MEASURE the donor before trusting it. The INTEGRITY in the key is what the
+                    # manifest CLAIMS, not what the file on disk contains - and under
+                    # -SkipIntegrityCheck nothing has ever hashed it - so without this the transplant
+                    # would be the D6 wrong-bytes bug wearing a new hat. Checked always, exactly like
+                    # the sanitized-name folder bind below.
+                    $donorOk = $false
+                    try { $donorOk = ((Get-FileMd5Base64 $prev.DiskPath) -ceq $d.Integrity) } catch { $donorOk = $false }
+                    if ($donorOk) {
+                        $d.DiskPath    = $prev.DiskPath
+                        $d.FileExists  = $true
+                        $d.IntegrityOk = $true
+                        $d.SizeBytes   = $prev.SizeBytes
+                        $d.LookupKey   = $prev.LookupKey
+                        $d.GapReason   = ''
+                        Write-Log ("'{0}' has no usable file in '{1}'; using the verified identical bytes exported in '{2}'." -f `
+                            $d.OriginalName, $label, $prev.Milestone) 'INFO'
+                    }
+                    else {
+                        Write-Log ("'{0}' has no file in '{1}' and the copy exported in '{2}' does not match the manifest checksum - recorded as a gap rather than publishing unverified bytes." -f `
+                            $d.OriginalName, $label, $prev.Milestone) 'WARN'
+                    }
+                }
+                $byKey[$key] = $d          # later snapshot wins on metadata
+                $collapsed++
+            }
+            else {
+                $d.AllMilestones = @($label)
+                $byKey[$key] = $d
+            }
+        }
+    }
+
+    $documents = [System.Collections.Generic.List[object]]::new()
+    foreach ($k in @($byKey.Keys)) { $documents.Add($byKey[$k]) }
+
+    $unkeyed = @($documents | Where-Object { [string]::IsNullOrWhiteSpace($_.Integrity) }).Count
+    if ($unkeyed -gt 0 -and $ordered.Count -gt 1) {
+        Write-Log ("{0} record(s) state no checksum, so they cannot be recognised as the same document across milestones and appear once per milestone export. They are listed individually in inventory.csv." -f $unkeyed) 'WARN'
+    }
+
+    $latest = $ordered[$ordered.Count - 1].Model.Batch
+    $batch  = $latest.PSObject.Copy()
+    $batch.Milestones = @($ordered | ForEach-Object { $_.Model.Batch.Milestone })
+    $batch.IsMerged   = ($ordered.Count -gt 1)
+
+    return [pscustomobject]@{
+        Batch = $batch; Documents = $documents; ObjectCount = $objectCount; Collapsed = $collapsed
+    }
+}
+
+# ----------------------------------------------------------------------------------------
+#  Version resolution across snapshots
+# ----------------------------------------------------------------------------------------
+# THE reported problem: "we have different version numbers of the same document, without knowing
+# which one is the correct final and approved version."
+#
+# OBJECTVERSIONSTATE is a per-SNAPSHOT fact. A v1 exported at milestone 3 says "Current" in that
+# manifest forever, even though milestone 11 carries a v2 that replaced it - so after merging, both
+# versions land in "01 Final" and the reader is left to guess. Supersession by a newer version of
+# the same document is not a judgement: it is derivable, and this derives it.
+#
+# Rule: inside one version group, the winner is the HIGHEST version the archive still calls
+# Current (if none is Current the group is superseded anyway, and the highest version stands in for
+# it). Every OTHER version is filed under "03 Superseded" and records what replaced it. Records
+# sharing the winner's version are left alone - they are the attachments of that one document (D5).
+function Resolve-EtmfVersions {
+    param($Model)
+
+    $groups = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([System.StringComparer]::Ordinal)
+    foreach ($d in $Model.Documents) {
+        $key = Get-EtmfVersionGroupKey $d
+        if ($null -eq $key) { continue }             # no document identity -> never grouped
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = [System.Collections.Generic.List[object]]::new() }
+        $groups[$key].Add($d)
+    }
+
+    $demoted = 0; $resolved = 0
+    foreach ($key in @($groups.Keys)) {
+        $members = $groups[$key]
+        # More than one DISTINCT version? Several records of the same version are one document's files.
+        $distinct = @($members | Group-Object Version).Count
+        if ($distinct -lt 2) { continue }
+
+        $currents = @($members | Where-Object { $_.VersionState -eq 'Current' })
+        # @() around the whole conditional: a one-element result would otherwise unroll to a scalar
+        # and $pool[0] throws under StrictMode.
+        $pool     = @(if ($currents.Count -gt 0) { $currents } else { $members })
+        $winner   = $pool[0]
+        foreach ($m in $pool) { if ((Compare-EtmfVersion $m.Version $winner.Version) -gt 0) { $winner = $m } }
+        # The WINNING VERSION is whatever the archive says is current, present or not: preferring a
+        # version whose file happens to be present would quietly promote an older document to
+        # "current", which misrepresents the TMF. Presence only breaks a TIE - two records of the
+        # SAME version (possible since collapse is cross-snapshot only), one bound and one a gap.
+        if (-not $winner.FileExists) {
+            $sameVersionPresent = @($pool | Where-Object { $_.FileExists -and (Compare-EtmfVersion $_.Version $winner.Version) -eq 0 })
+            if ($sameVersionPresent.Count -gt 0) { $winner = $sameVersionPresent[0] }
+        }
+        $resolved++
+
+        if (-not $winner.FileExists) {
+            Write-Log ("The current version of '{0}' (v{1}) has no file in the archive; older versions are still filed as superseded." -f `
+                $winner.OriginalName, $winner.Version) 'WARN'
+        }
+        $sharedChecksum = @($members | Group-Object Integrity | Where-Object { $_.Count -gt 1 -and $_.Name })
+        if ($sharedChecksum.Count -gt 0) {
+            Write-Log ("'{0}': versions {1} share one file and checksum - normal for this export format (the version history of one document), recorded here because it is also what a version RELABELLED between exports would look like." -f `
+                $winner.OriginalName, (@($members | ForEach-Object { 'v' + $_.Version } | Select-Object -Unique) -join ', ')) 'INFO'
+        }
+        $replacedBy = 'v{0} ({1}, {2})' -f $winner.Version, $winner.Status, $winner.Milestone
+        foreach ($m in $members) {
+            if ((Compare-EtmfVersion $m.Version $winner.Version) -eq 0) { continue }
+            $m.SupersededBy = $replacedBy
+            if ($m.Bucket -ne '03 Superseded') {
+                # It called itself Current in its own snapshot; a newer version says otherwise.
+                $m.Bucket = '03 Superseded'
+                $m.Status = 'Superseded'
+                $demoted++
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Demoted = $demoted; Groups = $resolved }
+}
+
+# ----------------------------------------------------------------------------------------
+#  Review flags + exclusions ("sort out the documents that should not be there")
+# ----------------------------------------------------------------------------------------
+# The other half of the customer's ask: an export "may contain incorrect documents (which in the
+# worst case belong to another study)". NOTHING in the manifest says a document does not belong -
+# that is a human judgement about the study, not a fact in the data - so the tool must not pretend
+# to make it. It does two separate things instead:
+#
+#   Set-EtmfReviewFlags  RAISES A FLAG and moves nothing. One flag is a fact (two records with
+#                        identical content), one is an explicitly conservative heuristic (a file
+#                        name naming another study's code). A false positive costs a glance.
+#   Set-EtmfExclusions   ACTS, but only on a decision a person wrote down in -ExclusionList. The
+#                        document is filed under _Excluded/ with the stated reason - kept, not
+#                        deleted, and reproduced identically on every future run.
+function Set-EtmfReviewFlags {
+    param($Model)
+
+    $flagged = 0
+    $addFlag = {
+        param($Doc, [string]$Flag, [string]$Reason)
+        $Doc.ReviewFlag   = (@($Doc.ReviewFlag, $Flag)     | Where-Object { $_ }) -join '; '
+        $Doc.ReviewReason = (@($Doc.ReviewReason, $Reason) | Where-Object { $_ }) -join '; '
+    }
+
+    # (1) FACT: the same bytes filed as two different documents. This is the "duplicates" half of
+    # the complaint, and it is exact - no threshold, no similarity, just one checksum in two records.
+    $byContent = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([System.StringComparer]::Ordinal)
+    foreach ($d in $Model.Documents) {
+        if ([string]::IsNullOrWhiteSpace($d.Integrity)) { continue }
+        if (-not $byContent.ContainsKey($d.Integrity)) { $byContent[$d.Integrity] = [System.Collections.Generic.List[object]]::new() }
+        $byContent[$d.Integrity].Add($d)
+    }
+    foreach ($key in @($byContent.Keys)) {
+        $members = $byContent[$key]
+        if ($members.Count -lt 2) { continue }
+        # Flag only what a TMF manager would ACT on: the same file filed under two different
+        # ARTIFACTS, i.e. in two different places in the TMF, which is a filing question someone has
+        # to answer. Everything else that shares bytes is ordinary: a document's own attachments and
+        # versions, and above all a template - one cover letter reused for DEU/SWE/JPN/USA as
+        # several country records under one artifact. Flagging those produced 10 flags on a
+        # 36-document archive, 8 of them that single cover letter, which buries the flag that
+        # matters ("Possible foreign study") in noise and teaches the reader to ignore the column.
+        $artifacts = @($members | ForEach-Object { $_.ArtifactNumber } | Select-Object -Unique)
+        if ($artifacts.Count -lt 2) { continue }
+        foreach ($m in $members) {
+            $others = @($members | Where-Object { $_.ArtifactNumber -ne $m.ArtifactNumber } |
+                        ForEach-Object { '{0} {1}' -f $_.ArtifactNumber, $_.OriginalName } | Select-Object -Unique)
+            & $addFlag $m 'Filed under two artifacts' ("identical content is also filed under: {0}" -f (($others | Select-Object -First 3) -join ', '))
+            $flagged++
+        }
+    }
+
+    # (2) HEURISTIC: the name mentions another study's code.
+    $codes = @($Model.Batch.StudyId, $Model.Batch.SpecificationId)
+    foreach ($d in $Model.Documents) {
+        $foreign = Get-EtmfForeignStudyCode ("{0} {1}" -f $d.OriginalName, $d.ArtifactTitle) $codes
+        if ($foreign) {
+            & $addFlag $d 'Possible foreign study' ("the name mentions '{0}', which is not this study's code ({1}) - check it belongs here" -f $foreign, $Model.Batch.StudyId)
+            $flagged++
+        }
+    }
+
+    return @($Model.Documents | Where-Object { $_.ReviewFlag }).Count
+}
+
+# Read the reviewer's exclusion decisions. Keyed on DocumentId (the id the inventory and the viewer
+# both show), optionally narrowed to one Version; Reason is carried into the output so the decision
+# is auditable where it took effect.
+function Import-EtmfExclusions {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "-ExclusionList file not found: $Path" }
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count -eq 0) {
+        Write-Log "Exclusion list is empty: $Path" 'WARN'
+        return @()
+    }
+    $columns = @($rows[0].PSObject.Properties.Name)
+    if ($columns -notcontains 'DocumentId') {
+        throw "-ExclusionList must have a 'DocumentId' column (found: $($columns -join ', ')). Optional: Version, ArtifactNumber, Country, SiteId, Reason."
+    }
+    # DocumentId ALONE IS NOT UNIQUE. In a real export the same id is reused across countries (3 of
+    # 12 in the reference archive span two), so a bare id can take out documents the reviewer never
+    # meant to touch - in the one feature whose job is controlling what reaches a client. These
+    # optional columns let a row say exactly which document it means; Set-EtmfExclusions warns when
+    # a row is coarse enough to hit several.
+    $get = { param($Row, $Name) if ($columns -contains $Name) { ([string]$Row.$Name).Trim() } else { '' } }
+
+    $out = foreach ($r in $rows) {
+        $id = ([string]$r.DocumentId).Trim()
+        if (-not $id) { continue }
+        [pscustomobject]@{
+            DocumentId     = $id
+            Version        = & $get $r 'Version'
+            ArtifactNumber = & $get $r 'ArtifactNumber'
+            Country        = & $get $r 'Country'
+            SiteId         = & $get $r 'SiteId'
+            Reason         = & $get $r 'Reason'
+            Matched        = 0
+            # DISTINCT documents hit, not raw matches: under -SplitByMilestone one document is
+            # matched once per snapshot, and counting those as "several documents" would cry wolf
+            # about the very precision warning that exists to be believed.
+            MatchedKeys    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        }
+    }
+    return @($out)
+}
+
+function Set-EtmfExclusions {
+    param($Model, $Exclusions)
+
+    $excluded = 0
+    foreach ($d in $Model.Documents) {
+        foreach ($x in $Exclusions) {
+            if ([string]$d.DocumentId -ne [string]$x.DocumentId) { continue }
+            if ($x.Version        -and ((Compare-EtmfVersion $d.Version $x.Version) -ne 0)) { continue }
+            if ($x.ArtifactNumber -and ($d.ArtifactNumber -ne $x.ArtifactNumber)) { continue }
+            if ($x.Country        -and ($d.Country -ne $x.Country)) { continue }
+            if ($x.SiteId         -and ([string]$d.SiteId -ne $x.SiteId)) { continue }
+            if ($d.Excluded) { break }                       # already excluded by an earlier row
+            $d.Excluded        = $true
+            $d.ExclusionReason = if ($x.Reason) { $x.Reason } else { 'excluded by the exclusion list (no reason given)' }
+            $d.Bucket          = '04 Excluded'
+            $d.Status          = 'Excluded'
+            $x.Matched         = $x.Matched + 1
+            [void]$x.MatchedKeys.Add(('{0}|{1}|{2}|{3}' -f $d.DocumentId, $d.ArtifactNumber, $d.Country, $d.SiteId))
+            $excluded++
+            # NAME what was excluded. A count alone cannot show a reviewer that their one row for a
+            # German cover letter also removed the Swedish one.
+            Write-Log ("Excluded: DocumentId {0} | {1} | {2} | v{3} | '{4}' - {5}" -f `
+                $d.DocumentId, $d.ArtifactNumber, $(if ($d.Country) { $d.Country } else { 'Trial' }), `
+                $d.Version, $d.OriginalName, $d.ExclusionReason) 'WARN'
+            break
+        }
+    }
+    return $excluded
+}
+
+# Report exclusion rows that did nothing, or did more than a reviewer is likely to have meant.
+# Called ONCE after every model has been processed, so a row that legitimately matches in one
+# milestone but not another is not reported as a miss.
+# After exclusions: a SupersededBy that names an excluded document sends the reader looking for
+# something no longer in the tree. Say so instead.
+function Update-EtmfSupersededReferences {
+    param($Model)
+    $excludedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($d in $Model.Documents) {
+        if ($d.Excluded) {
+            $k = Get-EtmfVersionGroupKey $d
+            if ($k) { [void]$excludedKeys.Add(('{0}|v{1}' -f $k, $d.Version)) }
+        }
+    }
+    if ($excludedKeys.Count -eq 0) { return }
+    foreach ($d in $Model.Documents) {
+        if ($d.Excluded -or -not $d.SupersededBy) { continue }
+        $k = Get-EtmfVersionGroupKey $d
+        if (-not $k) { continue }
+        # SupersededBy starts "v<version> (" - recover the version it names
+        $ver = ([regex]::Match($d.SupersededBy, '^v([^ ]+) ')).Groups[1].Value
+        if ($ver -and $excludedKeys.Contains(('{0}|v{1}' -f $k, $ver))) {
+            $d.SupersededBy = '{0} - EXCLUDED, see _Excluded' -f $d.SupersededBy
+        }
+    }
+}
+
+function Write-EtmfExclusionOutcome {
+    param($Exclusions)
+    foreach ($x in $Exclusions) {
+        if ($x.Matched -eq 0) {
+            # Nearly always a mistyped id, and silently excluding nothing is the worst outcome
+            # available: the reviewer believes a document was removed when it was not.
+            $narrow = @(
+                if ($x.Version)        { "version '$($x.Version)'" }
+                if ($x.ArtifactNumber) { "artifact '$($x.ArtifactNumber)'" }
+                if ($x.Country)        { "country '$($x.Country)'" }
+                if ($x.SiteId)         { "site '$($x.SiteId)'" }
+            ) -join ', '
+            $where = if ($narrow) { " with $narrow" } else { '' }
+            Write-Log ("Exclusion list: no document has DocumentId '{0}'{1} - nothing was excluded for that row. Check it against inventory.csv." -f $x.DocumentId, $where) 'WARN'
+        }
+        elseif ($x.MatchedKeys.Count -gt 1 -and -not ($x.ArtifactNumber -or $x.Country -or $x.SiteId)) {
+            Write-Log ("Exclusion list: DocumentId '{0}' matched {1} different documents (the same id is reused across artifacts/countries). If you meant only one, add an ArtifactNumber, Country or SiteId column to that row - the excluded documents are named above." -f `
+                $x.DocumentId, $x.MatchedKeys.Count) 'WARN'
+        }
+    }
+}
+
+# Reduce a model to the documents a client copy may contain: the version the eTMF calls Current
+# AND finalised/locked, minus anything the reviewer excluded. Returns what was left out, because a
+# partial TMF that does not say it is partial is the problem this tool exists to fix.
+function Select-EtmfFinalDocuments {
+    param($Model)
+
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $withheld = [pscustomobject]@{ Superseded = 0; InProgress = 0; Excluded = 0; NoFile = 0; Flagged = 0 }
+    foreach ($d in $Model.Documents) {
+        if ($d.Excluded)                     { $withheld.Excluded   = $withheld.Excluded + 1;   continue }
+        if ($d.Bucket -eq '03 Superseded')   { $withheld.Superseded = $withheld.Superseded + 1; continue }
+        if ($d.Bucket -eq '02 In Progress')  { $withheld.InProgress = $withheld.InProgress + 1; continue }
+        if (-not $d.FileExists)              { $withheld.NoFile     = $withheld.NoFile + 1 }
+        if ($d.ReviewFlag)                   { $withheld.Flagged    = $withheld.Flagged + 1 }
+        $kept.Add($d)
+    }
+    $Model.Documents = $kept
+    return $withheld
+}
+
+# ----------------------------------------------------------------------------------------
 #  Integrity verification (base64 MD5)
 # ----------------------------------------------------------------------------------------
 function Invoke-IntegrityCheck {
@@ -648,6 +1284,13 @@ function Invoke-IntegrityCheck {
     $ok = 0; $bad = 0; $missing = 0
     foreach ($d in $Documents) {
         if (-not $d.FileExists) { $missing++; $d.IntegrityOk = $false; continue }
+        if ([string]::IsNullOrWhiteSpace($d.Integrity)) {
+            # No checksum stated is not corruption. Reporting it as a MISMATCH would send a QA
+            # reviewer looking for a damaged file that is fine.
+            $bad++; $d.IntegrityOk = $false
+            Write-Log "No checksum stated in the manifest for '$($d.OriginalName)' - the copy could not be verified." 'WARN'
+            continue
+        }
         $actual = Get-FileMd5Base64 $d.DiskPath
         $match  = ($actual -ceq $d.Integrity)   # base64 is case-sensitive
         $d.IntegrityOk = $match
@@ -675,7 +1318,15 @@ function Get-HumanFileName {
     if ($MaxLength -gt 0) {
         $room = $MaxLength - $suffix.Length - $ext.Length
         if ($room -lt 8) { $room = 8 }
-        if ($stem.Length -gt $room) { $stem = $stem.Substring(0, $room - 1).TrimEnd() + '~' }  # ~ marks truncation
+        if ($stem.Length -gt $room) {
+            # Keep the START **and the END** of the name, with '~' marking the cut. Clinical file
+            # names are distinguished by their tail ("...-01" / "...-02", a date, a version), so
+            # head-only truncation collapses different documents onto one name; the collision guard
+            # then files them as " (2)", which reads to a reviewer like a duplicate of the first.
+            [int]$tailRoom = [Math]::Min(12, [int][Math]::Floor(($room - 1) / 2))
+            $head = $stem.Substring(0, $room - 1 - $tailRoom).TrimEnd()
+            $stem = $head + '~' + $stem.Substring($stem.Length - $tailRoom)
+        }
     }
     return (ConvertTo-SafeName ($stem + $suffix)) + $ext
 }
@@ -687,11 +1338,16 @@ function Invoke-Humanize {
         $Model,
         [string]$OutputRoot,
         [switch]$KeepOriginalNames,
-        [switch]$VerifyCopy
+        [switch]$VerifyCopy,
+        # -FinalOnly: every document in the tree is final, so a "01 Final" level under every
+        # artifact would be a folder that says nothing.
+        [switch]$OmitBucketFolder
     )
-    $batch    = $Model.Batch
     $treeRoot = Join-Path $OutputRoot 'Documents'
     New-Item -ItemType Directory -Path $treeRoot -Force | Out-Null
+    # Documents a reviewer excluded are KEPT (this is an archive) but filed outside the TMF tree,
+    # so the folder that gets handed to a client contains only what belongs in it.
+    $excludedRoot = Join-Path $OutputRoot '_Excluded'
 
     $used      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $inventory = [System.Collections.Generic.List[object]]::new()
@@ -699,7 +1355,9 @@ function Invoke-Humanize {
     $targetMaxPath = 250   # keep generated full paths comfortably under the Windows MAX_PATH (260)
 
     foreach ($d in $Model.Documents) {
-        $pp   = Get-ContentPathParts $d.ContentUrl $batch.TransferId
+        # Anchor on the record's OWN TransferID: after a merge the documents come from several
+        # snapshots, so the model's batch is not the one this CONTENTURL was written against.
+        $pp   = Get-ContentPathParts $d.ContentUrl $d.TransferId
         $note = ''
 
         if ($d.FileExists) {
@@ -707,7 +1365,9 @@ function Invoke-Humanize {
             $section  = ConvertTo-SafeName (Get-PrettyTmfSegment $pp.Section)
             $artifact = ConvertTo-SafeName ("{0} {1}" -f $d.ArtifactNumber, $d.ArtifactTitle)
 
-            $folder = Join-Path (Join-Path (Join-Path (Join-Path $treeRoot $zone) $section) $artifact) $d.Bucket
+            $root   = if ($d.Excluded) { $excludedRoot } else { $treeRoot }
+            $folder = Join-Path (Join-Path (Join-Path $root $zone) $section) $artifact
+            if (-not $OmitBucketFolder) { $folder = Join-Path $folder $d.Bucket }
             foreach ($s in $pp.Scope) { $folder = Join-Path $folder (ConvertTo-SafeName (Get-PrettyScope $s)) }
             New-Item -ItemType Directory -Path $folder -Force | Out-Null
 
@@ -740,11 +1400,16 @@ function Invoke-Humanize {
             $d.CopyIntegrityOk = $copyOk
         }
         else {
-            Write-Log "Missing source file (recorded as gap): $($d.OriginalName)" 'WARN'
-            $missing++; $note = 'MISSING SOURCE FILE'
+            # Say WHY, and say what was looked for - this log is what a customer emails back to us.
+            Write-Log ("Missing source file: '{0}' - {1}. CONTENTURL: {2} | looked for: {3}" -f `
+                $d.OriginalName, $d.GapReason, $d.ContentUrl, $d.LookupKey) 'WARN'
+            $missing++
+            $note = if ($d.GapReason) { "MISSING SOURCE FILE: $($d.GapReason)" } else { 'MISSING SOURCE FILE' }
         }
 
         $inventory.Add([pscustomobject]@{
+            Milestone      = $d.Milestone                            # snapshot this record came from
+            AllMilestones  = (@($d.AllMilestones) -join '; ')        # every snapshot it appeared in
             ArtifactNumber = $d.ArtifactNumber
             Zone           = Get-PrettyTmfSegment $pp.Zone
             Section        = Get-PrettyTmfSegment $pp.Section
@@ -761,6 +1426,11 @@ function Invoke-Humanize {
             Lifecycle      = $d.Lifecycle
             Bucket         = $d.Bucket
             Status         = $d.Status
+            SupersededBy   = $d.SupersededBy      # the version that replaced this one, if any
+            ReviewFlag      = $d.ReviewFlag       # raised by the tool, decided by a human
+            ReviewReason    = $d.ReviewReason
+            Excluded        = if ($d.Excluded) { 'Yes' } else { 'No' }
+            ExclusionReason = $d.ExclusionReason
             DocumentId     = $d.DocumentId
             ObjectId       = $d.ObjectId
             ArtifactDate   = $d.ArtifactDate
@@ -774,11 +1444,12 @@ function Invoke-Humanize {
             Signed         = if ($d.Signatures.Count -gt 0) { 'Yes' } else { 'No' }
             AuditRecords   = $d.AuditTrail.Count
             Note           = $note
+            ToolVersion    = $script:ToolVersion   # so a CSV separated from its folder still says what made it
         })
     }
 
     if ($shortened -gt 0) {
-        Write-Log ("{0} long file name(s) shortened (with a trailing ~) to stay within the Windows 260-char path limit; originals are in inventory.csv." -f $shortened) 'INFO'
+        Write-Log ("{0} long file name(s) shortened (the ~ marks where text was cut) to stay within the Windows 260-char path limit; originals are in inventory.csv." -f $shortened) 'INFO'
     }
 
     return [pscustomobject]@{
@@ -789,7 +1460,7 @@ function Invoke-Humanize {
 
 
 function New-HtmlViewer {
-    param($Model, [string]$OutputRoot, $Integrity)
+    param($Model, [string]$OutputRoot, $Integrity, [switch]$FinalOnlyCopy)
 
     $batch = $Model.Batch
 
@@ -803,11 +1474,14 @@ function New-HtmlViewer {
 
     # ---- per-document records for the front-end ----
     $records = foreach ($d in $Model.Documents) {
-        $pp    = Get-ContentPathParts $d.ContentUrl $batch.TransferId
+        # Anchor on the record's own TransferID - after a merge the batch belongs to one snapshot.
+        $pp    = Get-ContentPathParts $d.ContentUrl $d.TransferId
         $scope = @($pp.Scope | ForEach-Object { Get-PrettyScope $_ })
         $iso   = ConvertFrom-EmsDate $d.ArtifactDate
         $ctry  = if ($d.Country -and $alpha2.ContainsKey($d.Country)) { $alpha2[$d.Country] } else { $d.Country }
         [pscustomobject]@{
+            milestone    = $d.Milestone
+            milestones   = @($d.AllMilestones)      # every snapshot it appeared in (viewer filters on this)
             artNo        = $d.ArtifactNumber
             zone         = (Get-PrettyTmfSegment $pp.Zone)
             section      = (Get-PrettyTmfSegment $pp.Section)
@@ -822,6 +1496,11 @@ function New-HtmlViewer {
             lifecycle    = $d.Lifecycle
             bucket       = $d.Bucket
             status       = $d.Status
+            supersededBy = $d.SupersededBy
+            reviewFlag   = $d.ReviewFlag
+            reviewReason = $d.ReviewReason
+            excluded     = [bool]$d.Excluded
+            exclusionReason = $d.ExclusionReason
             restricted   = ($d.Restricted -ieq 'Yes')
             language     = $d.Language
             translation  = $d.Translation
@@ -836,6 +1515,7 @@ function New-HtmlViewer {
             relPath      = $d.RelPath
             sizeBytes    = $d.SizeBytes
             present      = [bool]$d.FileExists
+            gapReason    = $d.GapReason
             integrity    = $d.Integrity
             sourceOk     = [bool]$d.IntegrityOk
             copyOk       = [bool]$d.CopyIntegrityOk
@@ -857,11 +1537,23 @@ function New-HtmlViewer {
         tmfrm          = $batch.TmfRmVersion
         source         = $batch.TransferSource
         manifest       = $batch.ManifestFile
+        toolVersion    = $script:ToolVersion
+        runStamp       = $script:RunStamp
+        milestone      = $batch.Milestone                  # the latest snapshot in this view
+        milestones     = @($batch.Milestones)
+        milestoneCount = @($batch.Milestones).Count
+        merged         = [bool]$batch.IsMerged
+        finalOnly      = [bool]$FinalOnlyCopy
         generated      = (Get-Date).ToString('yyyy-MM-dd HH:mm')
         total          = $Model.Documents.Count
         final          = @($Model.Documents | Where-Object { $_.Bucket -eq '01 Final' }).Count
         inProgress     = @($Model.Documents | Where-Object { $_.Bucket -eq '02 In Progress' }).Count
         superseded     = @($Model.Documents | Where-Object { $_.Bucket -eq '03 Superseded' }).Count
+        excluded       = @($Model.Documents | Where-Object { $_.Excluded }).Count
+        # Flags on documents the reviewer already excluded are settled: counting them here would
+        # advertise a "Flagged (1)" filter that lists nothing, because the excluded ones live
+        # behind their own chip.
+        flagged        = @($Model.Documents | Where-Object { $_.ReviewFlag -and -not $_.Excluded }).Count
         signed         = @($Model.Documents | Where-Object { $_.Signatures.Count -gt 0 }).Count
         missing        = @($Model.Documents | Where-Object { -not $_.FileExists }).Count
         integrityOk    = $intOk
@@ -901,7 +1593,7 @@ function New-LandingPage {
             "<span class='w'>$($e.Missing) missing · $($e.CopyBad) mismatch</span>" } else { "<span class='ok'>integrity clean</span>" }
         @"
 <a class="card" href="$href">
-  <div class="ev">Event $(& $enc $e.Event)</div>
+  <div class="ev">$(& $enc $e.Event)</div>
   <div class="meta">$($e.Docs) documents · $($e.Final) final · $($e.InProgress) in&nbsp;progress · $($e.Superseded) superseded</div>
   <div class="meta">$warn</div>
 </a>
@@ -965,6 +1657,98 @@ function Show-Usage {
 }
 
 # ----------------------------------------------------------------------------------------
+#  "About this folder" - the scope statement that travels WITH a -FinalOnly copy
+# ----------------------------------------------------------------------------------------
+# A curated copy of a trial master file has to say, on its face, that it is curated: who made it,
+# from what, what is in it and what was deliberately left out. Without that a recipient cannot tell
+# a convenience copy from the archive, and the CRO has no record of what they handed over.
+function Write-EtmfScopeNote {
+    param([string]$Path, $Batch, [int]$Included, $Withheld, [string]$SourceInput, [string]$ExclusionList)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $add = { param([string]$Text = '') $lines.Add($Text) }
+
+    & $add "ABOUT THIS FOLDER"
+    & $add "================="
+    & $add ""
+    & $add "This folder holds the CURRENT, APPROVED documents of the trial master file for"
+    & $add ("{0}, taken from the eTMF export named below." -f $Batch.SpecificationId)
+    & $add ""
+    & $add ("  Source export : {0}" -f (Split-Path $SourceInput -Leaf))
+    & $add ("  Milestone     : {0}" -f $Batch.Milestone)
+    & $add ("  Prepared      : {0}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm'))
+    & $add ("  Prepared with : eTMF Archive Humanizer v{0}" -f $script:ToolVersion)
+    if ($ExclusionList) { & $add ("  Exclusion list: {0}" -f (Split-Path $ExclusionList -Leaf)) }
+    & $add ""
+    & $add "WHAT IS IN HERE"
+    & $add ("  {0} document(s) that the eTMF records as the current version AND as finalised" -f $Included)
+    & $add "  or locked. They are filed the familiar TMF way: Documents\Zone\Section\Artifact."
+    & $add ""
+    & $add "WHAT IS NOT IN HERE"
+    & $add ("  {0} superseded or replaced version(s)" -f $Withheld.Superseded)
+    & $add ("  {0} draft(s) or document(s) still under review" -f $Withheld.InProgress)
+    & $add ("  {0} document(s) set aside by the study team as not belonging to this trial" -f $Withheld.Excluded)
+    if ($Withheld.NoFile -gt 0) {
+        & $add ("  {0} of the included document(s) are listed but their file is not present in the" -f $Withheld.NoFile)
+        & $add "  export; they appear in index.html marked "source file not available"."
+    }
+    & $add ""
+    & $add "THIS IS NOT THE COMPLETE TRIAL MASTER FILE."
+    & $add "Superseded versions, drafts and their audit trails are retained in full by the"
+    & $add "study team. This copy exists so the current approved documents can be read and"
+    & $add "searched without the rest."
+    & $add ""
+    & $add "HOW TO USE IT"
+    & $add "  Open index.html in any web browser - no internet needed - to search every"
+    & $add "  document and read its details, history and signatures."
+    & $add "  inventory.csv lists the same documents as a spreadsheet."
+    & $add ""
+
+    [System.IO.File]::WriteAllLines($Path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# ----------------------------------------------------------------------------------------
+#  Run header - the first thing in every log
+# ----------------------------------------------------------------------------------------
+# A log is only worth emailing if it says what produced it: which build, which archive, which
+# options, on what. Without the version we could not tell whether a reported failure came from a
+# build that already contained the fix for it.
+function Show-RunHeader {
+    param([string]$ArchivePath, $BoundParameters)
+
+    $inputDesc = $ArchivePath
+    try {
+        $item = Get-Item -LiteralPath $ArchivePath -ErrorAction Stop
+        $kind = if ($item.PSIsContainer) { 'folder' } else { '{0:N1} MB' -f ($item.Length / 1MB) }
+        $inputDesc = '{0}  ({1}, modified {2:yyyy-MM-dd HH:mm})' -f $item.FullName, $kind, $item.LastWriteTime
+    }
+    catch { $inputDesc = "$ArchivePath  (not readable)" }
+
+    # Switches print as -Name, everything else as -Name <value>; ArchivePath is on its own line.
+    $opts = @()
+    if ($null -ne $BoundParameters) {
+        foreach ($k in @($BoundParameters.Keys | Sort-Object)) {
+            if ($k -eq 'ArchivePath') { continue }
+            $v = $BoundParameters[$k]
+            if ($v -is [switch] -or $v -is [bool]) { if ($v) { $opts += "-$k" } }
+            else { $opts += "-$k `"$v`"" }
+        }
+    }
+    $optText = if ($opts.Count) { $opts -join ' ' } else { '(defaults)' }
+
+    $os = try { [System.Runtime.InteropServices.RuntimeInformation]::OSDescription.Trim() } catch { 'unknown OS' }
+
+    Write-Out ""
+    Write-Out "==================== eTMF ARCHIVE HUMANIZER ====================" 'White'
+    Write-Out ("  Version    : {0}" -f $script:ToolVersion)
+    Write-Out ("  Run at     : {0}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))
+    Write-Out ("  Input      : {0}" -f $inputDesc)
+    Write-Out ("  Options    : {0}" -f $optText)
+    Write-Out ("  Running on : PowerShell {0} / {1} / machine {2}" -f $PSVersionTable.PSVersion, $os, [Environment]::MachineName)
+    Write-Out "===============================================================" 'White'
+}
+
+# ----------------------------------------------------------------------------------------
 #  Dry-run summary
 # ----------------------------------------------------------------------------------------
 function Show-Summary {
@@ -973,41 +1757,42 @@ function Show-Summary {
     $b = $Model.Batch
     $docs = $Model.Documents
 
-    Write-Host ""
-    Write-Host "==================== eTMF ARCHIVE SUMMARY ====================" -ForegroundColor White
-    Write-Host ("  Study (Specification) : {0}" -f $b.SpecificationId)
-    Write-Host ("  Study ID              : {0}" -f $b.StudyId)
-    Write-Host ("  Event / Transfer ID   : {0} / {1}" -f $b.EventId, $b.TransferId)
-    Write-Host ("  Source / TMF-RM ver   : {0} / {1}" -f $b.TransferSource, $b.TmfRmVersion)
-    Write-Host ("  Manifest              : {0}" -f $b.ManifestFile)
-    Write-Host ("  Documents (files)     : {0}" -f $docs.Count)
+    Write-Out ""
+    Write-Out "==================== eTMF ARCHIVE SUMMARY ====================" -ForegroundColor White
+    Write-Out ("  Study (Specification) : {0}" -f $b.SpecificationId)
+    Write-Out ("  Study ID              : {0}" -f $b.StudyId)
+    Write-Out ("  Milestone             : {0}" -f $b.Milestone)
+    Write-Out ("  Event / Transfer ID   : {0} / {1}" -f $b.EventId, $b.TransferId)
+    Write-Out ("  Source / TMF-RM ver   : {0} / {1}" -f $b.TransferSource, $b.TmfRmVersion)
+    Write-Out ("  Manifest              : {0}" -f $b.ManifestFile)
+    Write-Out ("  Documents (files)     : {0}" -f $docs.Count)
 
-    Write-Host "`n  -- By status bucket --" -ForegroundColor White
+    Write-Out "`n  -- By status bucket --" -ForegroundColor White
     $docs | Group-Object Bucket | Sort-Object Name | ForEach-Object {
-        Write-Host ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
+        Write-Out ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
     }
-    Write-Host "`n  -- By lifecycle --" -ForegroundColor White
+    Write-Out "`n  -- By lifecycle --" -ForegroundColor White
     $docs | Group-Object Lifecycle | Sort-Object Name | ForEach-Object {
-        Write-Host ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
+        Write-Out ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
     }
-    Write-Host "`n  -- By TMF level --" -ForegroundColor White
+    Write-Out "`n  -- By TMF level --" -ForegroundColor White
     $docs | Group-Object ObjectLevel | Sort-Object Name | ForEach-Object {
-        Write-Host ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
+        Write-Out ("     {0,-16} {1,3}" -f $_.Name, $_.Count)
     }
 
     $sigCount = @($docs | Where-Object { $_.Signatures.Count -gt 0 }).Count
-    Write-Host ("`n  E-signed documents     : {0}" -f $sigCount)
+    Write-Out ("`n  E-signed documents     : {0}" -f $sigCount)
 
     if ($Integrity) {
         $tot = $Integrity.Ok + $Integrity.Bad + $Integrity.Missing
         $col = if ($Integrity.Bad -eq 0 -and $Integrity.Missing -eq 0) { 'Green' } else { 'Yellow' }
-        Write-Host ("  Integrity (MD5)        : {0}/{1} OK, {2} mismatch, {3} missing" -f `
+        Write-Out ("  Integrity (MD5)        : {0}/{1} OK, {2} mismatch, {3} missing" -f `
             $Integrity.Ok, $tot, $Integrity.Bad, $Integrity.Missing) -ForegroundColor $col
     } else {
-        Write-Host "  Integrity (MD5)        : skipped" -ForegroundColor DarkGray
+        Write-Out "  Integrity (MD5)        : skipped" -ForegroundColor DarkGray
     }
 
-    Write-Host "`n  -- Document inventory (preview) --" -ForegroundColor White
+    Write-Out "`n  -- Document inventory (preview) --" -ForegroundColor White
     $docs |
         Sort-Object ArtifactNumber, Bucket, Country, OriginalName |
         Select-Object @{n='Art#';e={$_.ArtifactNumber}},
@@ -1017,26 +1802,68 @@ function Show-Summary {
                       @{n='Ctry';e={$_.Country}},
                       @{n='Int';e={ if($null -eq $_.IntegrityOk){'-'} elseif($_.IntegrityOk){'ok'} else {'X'} }},
                       @{n='Original file';e={ if($_.OriginalName.Length -gt 42){$_.OriginalName.Substring(0,39)+'...'}else{$_.OriginalName} }} |
-        Format-Table -AutoSize | Out-String -Width 160 | Write-Host
-    Write-Host "==============================================================" -ForegroundColor White
+        Format-Table -AutoSize | Out-String -Width 160 | ForEach-Object { Write-Out $_ }
+    Write-Out "==============================================================" -ForegroundColor White
 }
 
 function Show-Recap {
-    param([string]$OutputRoot, $Written, [string]$Landing)
-    Write-Host ""
-    Write-Host "==================== DONE ====================" -ForegroundColor White
-    Write-Host ("  Output folder : {0}" -f $OutputRoot) -ForegroundColor Green
+    param([string]$OutputRoot, $Written, [string]$Landing, $Gaps, [int]$Demoted = 0, [int]$Flagged = 0, [int]$Excluded = 0, $Withheld = $null)
+    Write-Out ""
+    Write-Out "==================== DONE ====================" -ForegroundColor White
+    Write-Out ("  Output folder : {0}" -f $OutputRoot) -ForegroundColor Green
+    if ($null -ne $Withheld) {
+        Write-Out  "  Contents      : CURRENT APPROVED DOCUMENTS ONLY - a copy to hand over," -ForegroundColor Cyan
+        Write-Out  "                  not the complete trial master file." -ForegroundColor Cyan
+        Write-Out ("                  Left out: {0} superseded, {1} in progress, {2} excluded." -f `
+            $Withheld.Superseded, $Withheld.InProgress, $Withheld.Excluded) -ForegroundColor Cyan
+        Write-Out  "                  'About this folder.txt' states this for the recipient." -ForegroundColor Cyan
+    }
     foreach ($e in $Written) {
         $flag = if ($e.Missing -gt 0 -or $e.CopyBad -gt 0) { '  [!]' } else { '' }
         $col  = if ($flag) { 'Yellow' } else { 'Gray' }
-        Write-Host ("    Event {0,-4} {1,3} docs  ({2} final / {3} in-progress / {4} superseded)  copied {5}{6}" -f `
-            $e.Event, $e.Docs, $e.Final, $e.InProgress, $e.Superseded, $e.Copied, $flag) -ForegroundColor $col
-        if ($e.Missing -gt 0) { Write-Host ("           {0} document(s) missing source files" -f $e.Missing) -ForegroundColor Yellow }
-        if ($e.CopyBad -gt 0) { Write-Host ("           {0} copy integrity mismatch(es)" -f $e.CopyBad) -ForegroundColor Yellow }
+        # The counts must add up to the total, or the reader is left hunting for the difference.
+        $exc = if ($e.Excluded -gt 0) { ' / {0} excluded' -f $e.Excluded } else { '' }
+        Write-Out ("    {0,-30} {1,3} docs  ({2} final / {3} in-progress / {4} superseded{5})  copied {6}{7}" -f `
+            $e.Event, $e.Docs, $e.Final, $e.InProgress, $e.Superseded, $exc, $e.Copied, $flag) -ForegroundColor $col
+        if ($e.Missing -gt 0) { Write-Out ("           {0} document(s) missing source files" -f $e.Missing) -ForegroundColor Yellow }
+        if ($e.CopyBad -gt 0) { Write-Out ("           {0} copy integrity mismatch(es)" -f $e.CopyBad) -ForegroundColor Yellow }
+    }
+    # The headline answer to "which one is the current approved version?".
+    if ($Demoted -gt 0) {
+        Write-Out ""
+        Write-Out ("  {0} older version(s) were filed under '03 Superseded' because a newer" -f $Demoted) -ForegroundColor Cyan
+        Write-Out  "  version of the same document exists in the archive. inventory.csv's" -ForegroundColor Cyan
+        Write-Out  "  SupersededBy column names the version that replaced each one." -ForegroundColor Cyan
+    }
+
+    if ($Excluded -gt 0) {
+        Write-Out ""
+        Write-Out ("  {0} document(s) from your exclusion list were filed under '_Excluded'" -f $Excluded) -ForegroundColor Cyan
+        Write-Out  "  (kept, with the reason, but outside the TMF tree)." -ForegroundColor Cyan
+    }
+    if ($Flagged -gt 0) {
+        Write-Out ""
+        Write-Out ("  {0} document(s) are FLAGGED FOR REVIEW and still in the TMF tree; the" -f $Flagged) -ForegroundColor Yellow
+        Write-Out  "  tool cannot know whether they belong here. See inventory.csv's ReviewFlag" -ForegroundColor Yellow
+        Write-Out  "  column (or the viewer's 'Flagged' filter), then list the ones that do not" -ForegroundColor Yellow
+        Write-Out  "  belong in a CSV and re-run with -ExclusionList to file them separately." -ForegroundColor Yellow
+    }
+
+    # Group the gaps by CAUSE. "12 missing" prompts a mail asking why; "12 - the archive contains no
+    # entry with this exact path" is already the answer, and points at the export rather than at us.
+    if ($Gaps -and @($Gaps).Count -gt 0) {
+        Write-Out ""
+        Write-Out "  Missing source files, by cause:" -ForegroundColor Yellow
+        foreach ($g in $Gaps) {
+            Write-Out ("    {0,4}  {1}" -f $g.Count, $g.Reason) -ForegroundColor Yellow
+        }
+        Write-Out "          Each one is listed in inventory.csv (Note column) with its" -ForegroundColor Yellow
+        Write-Out "          CONTENTURL, and in the run log with the exact path that was looked for." -ForegroundColor Yellow
     }
     $open = if ($Landing) { $Landing } else { $Written[0].Index }
-    Write-Host ("  Open viewer   : {0}" -f $open) -ForegroundColor Green
-    Write-Host "=============================================" -ForegroundColor White
+    Write-Out ""
+    Write-Out ("  Open viewer   : {0}" -f $open) -ForegroundColor Green
+    Write-Out "=============================================" -ForegroundColor White
 }
 
 
@@ -1092,7 +1919,26 @@ function Get-ViewerTemplate {
   .chip.on[data-s="01 Final"]{background:var(--final)}
   .chip.on[data-s="02 In Progress"]{background:var(--prog)}
   .chip.on[data-s="03 Superseded"]{background:var(--sup)}
+  .chip.on[data-s="04 Excluded"]{background:#8a4b4b}
+  .b-exc{color:#8a4b4b;background:#f7e9e9}
+  .flagchip{border-color:#e0c98a;color:#8a6d1e;background:#fdf8e8}
+  .flagchip.on{background:#9a6700;color:#fff;border-color:transparent}
+  .flag{color:#9a6700}
+  .flagbox{background:#fdf8e8;border:1px solid #ecdfae;color:#6b5a1e;border-radius:8px;padding:9px 11px;margin:0 0 12px;font-size:12.5px;line-height:1.45}
+  .excbox{background:#f7e9e9;border:1px solid #e6cccc;color:#7d4444;border-radius:8px;padding:9px 11px;margin:0 0 12px;font-size:12.5px;line-height:1.45}
   .resultCount{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
+  [hidden]{display:none !important}
+  .filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 16px;background:#fdf8e8;border-bottom:1px solid #ecdfae;font-size:12.5px;color:#6b5a1e}
+  .fb-label{font-weight:600}
+  .fchip{background:#fff;border:1px solid #e5d9ae;border-radius:20px;padding:2px 10px;white-space:nowrap}
+  #filterList{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+  .fb-show{border:1px solid #d9c78a;background:#fff;color:#6b5a1e;border-radius:5px;padding:0 6px;margin-left:6px;cursor:pointer;font-size:11.5px}
+  .vh{overflow-wrap:anywhere}
+  .vh .vh-none{display:flex;align-items:center;gap:8px;padding:6px 9px;border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12.5px}
+  .fb-clear{flex:0 0 auto;margin-left:auto;border:1px solid #d9c78a;background:#fff;color:#6b5a1e;border-radius:7px;padding:4px 10px;cursor:pointer;font-size:12.5px}
+  .fb-clear:hover{background:#fffaf0}
+  #docTable.no-ms .col-ms{display:none}
+  td.ms{color:var(--muted);white-space:nowrap;max-width:170px;overflow:hidden;text-overflow:ellipsis}
   .tablewrap{overflow:auto;flex:1}
   table{border-collapse:collapse;width:100%;font-size:13px}
   thead th{position:sticky;top:0;background:#f0f3f7;text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer;white-space:nowrap;font-weight:600;color:#3a4654}
@@ -1120,6 +1966,7 @@ function Get-ViewerTemplate {
   .d-body{padding:16px 20px}
   .openbtn{display:inline-block;margin:6px 0 14px;padding:9px 14px;background:var(--accent);color:#fff;border-radius:8px;text-decoration:none;font-weight:600;font-size:13px}
   .openbtn:hover{background:#1d4f86}
+  .gapwhy{background:#fdf3f3;border:1px solid #f0d5d5;color:#8a4b4b;border-radius:8px;padding:9px 11px;margin:0 0 14px;font-size:12.5px;line-height:1.45}
   .sec{margin:18px 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);border-bottom:1px solid var(--line);padding-bottom:5px}
   .kv{display:grid;grid-template-columns:130px 1fr;gap:4px 12px;font-size:13px}
   .kv .k{color:var(--muted)}
@@ -1156,10 +2003,19 @@ function Get-ViewerTemplate {
   </aside>
   <main>
     <div class="toolbar">
-      <input id="search" type="search" placeholder="Search title, document, artifact #…" autocomplete="off">
+      <input id="search" type="search" placeholder="Search title, document, artifact #, zone, site, status, ID…" autocomplete="off">
       <div class="chips" id="statusChips"></div>
       <select id="countryFilter"><option value="all">All countries</option></select>
+      <select id="milestoneFilter" hidden><option value="all">All milestones</option></select>
+      <button type="button" class="chip flagchip" id="flagToggle" hidden></button>
       <span class="resultCount" id="resultCount"></span>
+    </div>
+    <!-- Shown only while something is filtered out: a reviewer who cannot find a document must be
+         able to see that the view is narrowed, and undo it in one click. -->
+    <div class="filterbar" id="filterBar" hidden>
+      <span class="fb-label">Showing a filtered view:</span>
+      <span id="filterList"></span>
+      <button type="button" class="fb-clear" id="clearFilters">Clear all filters</button>
     </div>
     <div class="tablewrap">
       <table id="docTable">
@@ -1168,6 +2024,7 @@ function Get-ViewerTemplate {
           <th data-key="title">Title</th>
           <th data-key="originalName">Document</th>
           <th data-key="scope">Country / Site</th>
+          <th class="col-ms" data-key="milestone" title="The most recent milestone export that still contained this document">Last export</th>
           <th data-key="version">Ver</th>
           <th data-key="status">Status</th>
           <th data-key="date">Date</th>
@@ -1188,51 +2045,130 @@ const DATA = /*__DATA__*/;
 
 const $ = s => document.querySelector(s);
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const href = p => p ? encodeURI(p) : '#';
+// Encode each path SEGMENT: encodeURI() deliberately leaves '#' (and '?', '&') alone, so a document
+// called "Protocol Amendment #2.pdf" - a name Windows allows and our sanitizer therefore keeps -
+// produced a link the browser cut at the '#'. The file was on disk; only the link was broken.
+const href = p => p ? p.split('/').map(encodeURIComponent).join('/') : '#';
 // Documents open in a new tab so the viewer stays put.
 const linkTgt = ' target="_blank" rel="noopener noreferrer"';
 const fmtSize = b => { if(!b) return ''; const u=['B','KB','MB','GB']; let i=0,n=b; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (n<10&&i>0?n.toFixed(1):Math.round(n))+' '+u[i]; };
 const fmtTs = s => { if(!s) return ''; const d=new Date(s); return isNaN(d)? s : d.toISOString().slice(0,16).replace('T',' ')+' UTC'; };
-const bClass = b => b==='01 Final'?'b-final':b==='02 In Progress'?'b-prog':'b-sup';
+// Same rule as Compare-EtmfVersion on the PowerShell side: segment-wise, so v10 > v9 and
+// v1.10 > v1.9. Parsing "1.10" as a number makes it 1.1 and sorts it below 1.9.
+const cmpVersion = (a,b) => {
+  const sa=String(a==null?'':a).trim().split('.'), sb=String(b==null?'':b).trim().split('.');
+  const num = s => s.length>0 && s.every(x=>/^\d+$/.test(x));
+  if(num(sa)&&num(sb)){
+    for(let i=0;i<Math.max(sa.length,sb.length);i++){
+      const x=+(sa[i]||0), y=+(sb[i]||0);
+      if(x!==y) return x<y?-1:1;
+    }
+    return 0;
+  }
+  const x=String(a==null?'':a), y=String(b==null?'':b);
+  return x<y?-1:x>y?1:0;
+};
+const bClass = b => b==='01 Final'?'b-final':b==='02 In Progress'?'b-prog':b==='04 Excluded'?'b-exc':'b-sup';
 
-const state = { search:'', status:'all', country:'all', node:null, sortKey:'artNo', sortDir:1 };
+const state = { search:'', searchRaw:'', status:'all', country:'all', milestone:'all', flagged:false, node:null, sortKey:'artNo', sortDir:1 };
+
+// One lower-cased haystack per document, built once. Searching a TMF means searching for whatever
+// the reviewer happens to remember - an artifact number, a zone, a site, a status word, a document
+// ID, the milestone - so every field a reader can see is in here, and the per-keystroke filter is
+// then a single string test rather than a dozen concatenations per row.
+// PowerShell's ConvertTo-Json emits a one-element array as a bare value on some hosts, so never
+// assume this field is an array.
+const msList = d => !d.milestones ? [] : (Array.isArray(d.milestones) ? d.milestones : [d.milestones]);
+DATA.forEach(d => { d._hay = [d.artNo, d.title, d.originalName, d.newName, d.artifact, d.zone,
+  d.section, d.scope, d.country, d.level, d.person, d.version, d.status, d.lifecycle,
+  d.versionState, d.documentId, msList(d).join(' '), d.date, d.reviewFlag, d.supersededBy,
+  d.exclusionReason]
+  .filter(Boolean).join(' ').toLowerCase(); });
 
 // ---- header ----
 $('#studyName').textContent = META.study || META.studyId || 'eTMF Archive';
+// A merged view spans every milestone export in the archive, so naming a single event would be a
+// lie; name the span and the latest snapshot instead. (Per-milestone filtering: see #2.)
+const scopeTxt = META.merged
+  ? `<b>${esc(META.milestoneCount)}</b> milestones merged · latest <b>${esc(META.milestone)}</b>`
+  : `Milestone <b>${esc(META.milestone)}</b> · Transfer <b>${esc(META.transferId)}</b>`;
 $('#studySub').innerHTML =
-  `Event <b>${esc(META.event)}</b> · Transfer <b>${esc(META.transferId)}</b> · TMF-RM <b>${esc(META.tmfrm)}</b> · Source <b>${esc(META.source)}</b>`;
+  `${scopeTxt} · TMF-RM <b>${esc(META.tmfrm)}</b> · Source <b>${esc(META.source)}</b>` +
+  (META.finalOnly ? ` · <b>current approved documents only</b>` : '');
 const intTxt = META.integrityChecked ? `${META.integrityOk}/${META.integrityTotal}` : 'n/a';
-const countDefs = [['Total',META.total],['Final',META.final],['In&nbsp;Progress',META.inProgress],
-  ['Superseded',META.superseded],['E-signed',META.signed],['Integrity',intTxt]];
-if (META.missing) countDefs.push(['Missing',META.missing]);
+const countDefs = [['Total',META.total]];
+if (!META.finalOnly) countDefs.push(['Final',META.final],['In&nbsp;Progress',META.inProgress],['Superseded',META.superseded]);
+countDefs.push(['E-signed',META.signed],['Integrity',intTxt]);
+if (META.missing)  countDefs.push(['Missing',META.missing]);
+if (META.flagged)  countDefs.push(['Flagged',META.flagged]);
+if (META.excluded) countDefs.push(['Excluded',META.excluded]);
 $('#counts').innerHTML = countDefs
   .map(([l,n])=>`<div class="count"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
-$('#footer').innerHTML = `Generated ${esc(META.generated)} from <b>${esc(META.manifest)}</b> · ${META.total} documents · eTMF Archive Humanizer`;
+$('#footer').innerHTML = `Generated ${esc(META.generated)} from <b>${esc(META.manifest)}</b> · ${META.total} documents · eTMF Archive Humanizer <b>v${esc(META.toolVersion)}</b>`;
 
 // ---- status chips ----
-const chips = [['all','All'],['01 Final','Final'],['02 In Progress','In Progress'],['03 Superseded','Superseded']];
+// "All" means all of the TMF - excluded documents are reached through their own chip, so the folder
+// a client is handed and the list they browse agree with each other. They are never hidden outright:
+// the header carries an Excluded count whenever there are any.
+// Only offer a filter for a bucket this copy actually contains: in a -FinalOnly copy an "In
+// Progress" chip that always lists nothing invites the reader to wonder what is being hidden.
+const bucketsPresent = new Set(DATA.map(d=>d.bucket));
+const chips = [['all','All']].concat(
+  [['01 Final','Final'],['02 In Progress','In Progress'],['03 Superseded','Superseded']]
+    .filter(([b])=>bucketsPresent.has(b)));
+if (META.excluded) chips.push(['04 Excluded','Excluded']);
+// One bucket and nothing excluded (a -FinalOnly copy): "All" and "Final" would be the same filter.
+if (chips.length < 3) { $('#statusChips').hidden = true; }
 $('#statusChips').innerHTML = chips.map(([s,l])=>`<span class="chip${s==='all'?' on':''}" data-s="${s}">${l}</span>`).join('');
 $('#statusChips').addEventListener('click',e=>{ const c=e.target.closest('.chip'); if(!c) return;
-  state.status=c.dataset.s; document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on',x===c)); render(); });
+  state.status=c.dataset.s;
+  // Scoped: #flagToggle is also a .chip, and a document-wide selector de-highlighted it while its
+  // filter stayed on - leaving the control showing the opposite of its state.
+  document.querySelectorAll('#statusChips .chip').forEach(x=>x.classList.toggle('on',x===c)); render(); });
+
+// ---- milestone filter ----
+// Filtering on the record's OWN milestone would be near-useless: after the merge that is the newest
+// snapshot for almost every document. The question a reviewer actually asks is "what did the TMF
+// hold at milestone N", so this filters on MEMBERSHIP - was the document in that export at all -
+// and the options come from the archive's milestone list, not from the surviving records.
+const allMilestones = Array.isArray(META.milestones) ? META.milestones : [META.milestones];
+if (META.milestoneCount > 1) {
+  $('#milestoneFilter').innerHTML = '<option value="all">All milestones</option>' +
+    allMilestones.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+  $('#milestoneFilter').hidden = false;
+} else {
+  $('#docTable').classList.add('no-ms');   // one snapshot: the column would repeat on every row
+}
+$('#milestoneFilter').addEventListener('change',e=>{ state.milestone=e.target.value; render(); });
 
 // ---- country filter ----
 const countries = [...new Set(DATA.map(d=>d.country).filter(Boolean))].sort();
-$('#countryFilter').innerHTML = '<option value="all">All countries</option>' + countries.map(c=>`<option>${esc(c)}</option>`).join('');
+// value= is required: option.value falls back to option.text, which the DOM returns with internal
+// whitespace collapsed - so any label containing a double space would filter to nothing.
+$('#countryFilter').innerHTML = '<option value="all">All countries</option>' + countries.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
 $('#countryFilter').addEventListener('change',e=>{ state.country=e.target.value; render(); });
 
+// ---- flagged-for-review toggle ----
+if (META.flagged) {
+  const t = $('#flagToggle');
+  t.hidden = false;
+  t.textContent = `\u2691 Flagged for review (${META.flagged})`;
+  t.addEventListener('click',()=>{ state.flagged=!state.flagged; t.classList.toggle('on',state.flagged); render(); });
+}
+
 // ---- search ----
-$('#search').addEventListener('input',e=>{ state.search=e.target.value.toLowerCase(); render(); });
+$('#search').addEventListener('input',e=>{ state.searchRaw=e.target.value; state.search=e.target.value.toLowerCase(); render(); });
 
 // ---- tree ----
 function buildTree(){
   const t={};
-  DATA.forEach(d=>{
+  DATA.filter(d=>!d.excluded).forEach(d=>{
     const z=t[d.zone]??=({c:0,f:0,s:{}}); z.c++; if(d.bucket!=='01 Final')z.f++;
     const se=z.s[d.section]??=({c:0,f:0,a:{}}); se.c++; if(d.bucket!=='01 Final')se.f++;
     const a=se.a[d.artifact]??=({c:0,f:0}); a.c++; if(d.bucket!=='01 Final')a.f++;
   });
   const dot=o=>`<span class="dot" style="background:${o.f?'var(--prog)':'var(--final)'}"></span>`;
-  let h='<ul><li><div class="node active" data-type="all">All documents<span class="cnt">'+DATA.length+'</span></div></li>';
+  let h='<ul><li><div class="node active" data-type="all">All documents<span class="cnt">'+DATA.filter(d=>!d.excluded).length+'</span></div></li>';
   for(const zn of Object.keys(t).sort()){ const z=t[zn];
     h+=`<li class="znode"><div class="node zone" data-type="zone" data-v="${esc(zn)}"><span class="twist">▼</span>${dot(z)}${esc(zn)}<span class="cnt">${z.c}</span></div><ul>`;
     for(const sn of Object.keys(z.s).sort()){ const se=z.s[sn];
@@ -1256,21 +2192,74 @@ $('#tree').addEventListener('click',e=>{
 });
 
 // ---- filtering + table ----
-function matches(d){
+// The user's own filters, with the exclusion rule left out - so render() can tell the difference
+// between "your filter hid it" and "it is excluded from the TMF", which are not the same message.
+function matchesCore(d){
   if(state.status!=='all' && d.bucket!==state.status) return false;
+  if(state.flagged && !d.reviewFlag) return false;
   if(state.country!=='all' && d.country!==state.country) return false;
+  if(state.milestone!=='all' && msList(d).indexOf(state.milestone)<0) return false;
   if(state.node){ if(state.node.type==='zone'&&d.zone!==state.node.v) return false;
     if(state.node.type==='section'&&d.section!==state.node.v) return false;
     if(state.node.type==='artifact'&&d.artifact!==state.node.v) return false; }
-  if(state.search){ const h=(d.artNo+' '+d.title+' '+d.originalName+' '+d.newName+' '+d.artifact+' '+d.scope).toLowerCase();
-    if(!h.includes(state.search)) return false; }
+  if(state.search && !d._hay.includes(state.search)) return false;
   return true;
 }
+function matches(d){
+  // Excluded documents are reachable only under their own chip: the client-facing tree is the
+  // product, so hiding them is the default - but never SILENTLY (see renderFilterBar).
+  if(d.excluded && state.status!=='04 Excluded') return false;
+  return matchesCore(d);
+}
+
+// ---- active filters: say what is being hidden, and offer one click to undo it ----
+const chipLabel = s => (chips.find(c=>c[0]===s)||[,s])[1];
+function activeFilters(){
+  const a=[];
+  if(state.searchRaw)          a.push(['Search', '\u201c'+state.searchRaw+'\u201d']);
+  if(state.status!=='all')     a.push(['Status', chipLabel(state.status)]);
+  if(state.country!=='all')    a.push(['Country', state.country]);
+  if(state.milestone!=='all')  a.push(['In milestone', state.milestone]);
+  if(state.flagged)            a.push(['Only', 'flagged for review']);
+  if(state.node)               a.push([state.node.type.charAt(0).toUpperCase()+state.node.type.slice(1), state.node.v]);
+  return a;
+}
+// How many EXCLUDED documents the current filters would otherwise have shown. Only then is the
+// exclusion worth mentioning: a permanent notice would turn the bar into furniture and destroy its
+// one-glance "something is narrowed" signal, but staying silent produced a search that dead-ends on
+// a document the archive does contain - and, when everything is excluded, a viewer that just looks
+// broken.
+function hiddenExcludedCount(){
+  if(state.status==='04 Excluded') return 0;
+  return DATA.filter(d=>d.excluded && matchesCore(d)).length;
+}
+function renderFilterBar(){
+  const a=activeFilters();
+  const hidden=hiddenExcludedCount();
+  $('#filterBar').hidden = (a.length===0 && hidden===0);
+  const chips=a.map(([k,v])=>`<span class="fchip">${esc(k)}: ${esc(v)}</span>`);
+  if(hidden>0) chips.push(`<span class="fchip">${hidden} excluded from the TMF, not shown <button type="button" class="fb-show" id="showExcluded">show</button></span>`);
+  $('#filterList').innerHTML = chips.join('');
+  const btn=$('#showExcluded');
+  if(btn) btn.addEventListener('click',()=>{
+    const chip=document.querySelector('.chip[data-s="04 Excluded"]');
+    if(chip) chip.click();
+  });
+}
+$('#clearFilters').addEventListener('click',()=>{
+  state.search=''; state.status='all'; state.country='all'; state.milestone='all'; state.node=null;
+  state.flagged=false; const ft=$('#flagToggle'); if(ft) ft.classList.remove('on');
+  $('#search').value=''; $('#countryFilter').value='all'; $('#milestoneFilter').value='all';
+  document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on', c.dataset.s==='all'));
+  const all=document.querySelector('#tree .node[data-type="all"]');
+  document.querySelectorAll('#tree .node').forEach(n=>n.classList.toggle('active', n===all));
+  render();
+});
 function render(){
   let rows=DATA.filter(matches);
   const k=state.sortKey, dir=state.sortDir;
   rows.sort((a,b)=>{ let x=a[k],y=b[k];
-    if(k==='version'){x=+x||0;y=+y||0;}
+    if(k==='version'){ const c=cmpVersion(a.version,b.version); return c*dir; }
     else if(k==='date'){x=a.dateIso||'';y=b.dateIso||'';}        // sort by ISO date, not the display string
     else {x=(''+x).toLowerCase();y=(''+y).toLowerCase();}
     return x<y?-1*dir:x>y?dir:0; });
@@ -1279,21 +2268,27 @@ function render(){
     const idx=DATA.indexOf(d);
     const sig=d.signatures&&d.signatures.length?' <span class="sig" title="Electronically signed">✎</span>':'';
     const restr=d.restricted?' <span title="Restricted artifact" style="color:#b23b3b">🔒</span>':'';
+    const flag=d.reviewFlag?` <span class="flag" title="${esc(d.reviewReason)}">\u2691</span>`:'';
     const integ = !d.present ? '<span class="no" title="Source file missing">⚠</span>'
                 : d.copyOk ? '<span class="ok" title="MD5 verified">✓</span>'
                 : (META.integrityChecked?'<span class="no" title="Integrity mismatch">✗</span>':'');
     return `<tr data-i="${idx}">
       <td class="art">${esc(d.artNo)}</td>
-      <td>${esc(d.title)}${sig}${restr}</td>
+      <td>${esc(d.title)}${sig}${restr}${flag}</td>
       <td class="doc" title="${esc(d.originalName)}">${esc(d.originalName)}</td>
       <td>${esc(d.scope||(d.level==='Trial'?'—':d.country))}</td>
+      <td class="ms col-ms" title="Exported in: ${esc(msList(d).join('; '))}">${esc(d.milestone)}</td>
       <td>${esc(d.version)}</td>
       <td><span class="badge ${bClass(d.bucket)}">${esc(d.status)}</span></td>
       <td>${esc(d.date)}</td>
       <td>${integ}</td></tr>`;
   }).join('');
   $('#empty').style.display = rows.length?'none':'block';
-  $('#resultCount').textContent = rows.length+' of '+DATA.length+' documents';
+  // Count against the reachable set, not DATA: "6 of 7" while All shows 6 sends a reader hunting
+  // for a document the view was never going to list.
+  const reachable = DATA.filter(d=> state.status==='04 Excluded' ? d.excluded : !d.excluded).length;
+  $('#resultCount').textContent = rows.length+' of '+reachable+' documents';
+  renderFilterBar();
   document.querySelectorAll('th[data-key]').forEach(th=>{
     const a=th.querySelector('.arrow'); if(a)a.remove();
     if(th.dataset.key===k){ const s=document.createElement('span'); s.className='arrow'; s.textContent=dir>0?'▲':'▼'; th.appendChild(s); }
@@ -1308,10 +2303,16 @@ $('#tbody').addEventListener('click',e=>{ const tr=e.target.closest('tr'); if(tr
 function openDrawer(i){
   const d=DATA[i];
   const versions=DATA.map((x,ix)=>({x,ix})).filter(o=>o.x.documentId&&o.x.documentId===d.documentId&&o.x.artNo===d.artNo&&o.x.country===d.country)
-    .sort((a,b)=>(+a.x.version||0)-(+b.x.version||0));
+    .sort((a,b)=>cmpVersion(a.x.version,b.x.version));
   const vh = versions.length>1 ? `<div class="sec">Version history</div><div class="vh">`+
-    versions.map(o=>`<a class="${o.ix===i?'cur':''}" href="${href(o.x.relPath)}"${linkTgt}>
-        <span class="badge ${bClass(o.x.bucket)}">${esc(o.x.status)}</span> v${esc(o.x.version)} <span style="color:var(--muted)">${esc(o.x.originalName)}</span></a>`).join('')+`</div>` : '';
+    versions.map(o=>{
+      const label=`<span class="badge ${bClass(o.x.bucket)}">${esc(o.x.status)}</span> v${esc(o.x.version)} <span style="color:var(--muted)">${esc(o.x.originalName)}</span>`;
+      // href="#" with target=_blank opened a second copy of the viewer; a version with no file is
+      // not a link at all.
+      return (o.x.present && o.x.relPath)
+        ? `<a class="${o.ix===i?'cur':''}" href="${href(o.x.relPath)}"${linkTgt}>${label}</a>`
+        : `<span class="vh-none ${o.ix===i?'cur':''}" title="Source file not available">${label} \u26a0</span>`;
+    }).join('')+`</div>` : '';
   const sigs = d.signatures&&d.signatures.length ? `<div class="sec">Signatures (${d.signatures.length})</div>`+
     d.signatures.map(s=>`<div class="sigbox"><div class="nm">${esc(s.signer)}</div>
       <div>${esc(s.methodology)} signature · ${esc(fmtTs(s.dateTime))}</div>
@@ -1327,15 +2328,22 @@ function openDrawer(i){
       <span style="color:var(--muted);font-size:12px"> ${esc(d.artNo)} · v${esc(d.version)}</span>
     </div>
     <div class="d-body">
+      ${d.excluded?`<div class="excbox"><b>Excluded from the TMF tree.</b><br>${esc(d.exclusionReason)}<br>
+         <span style="color:var(--muted)">Filed under _Excluded, not deleted. This came from the exclusion list you supplied.</span></div>`:''}
+      ${d.reviewFlag?`<div class="flagbox"><b>\u2691 Flagged for review: ${esc(d.reviewFlag)}</b><br>${esc(d.reviewReason)}<br>
+         <span style="color:var(--muted)">A flag is a prompt to look, not a verdict - the tool cannot know whether this document belongs here.</span></div>`:''}
       ${d.present && d.relPath ? `<a class="openbtn" href="${href(d.relPath)}"${linkTgt}>Open document ↗</a>`
-        : `<div class="openbtn" style="background:var(--sup);cursor:default">⚠ Source file not available</div>`}
+        : `<div class="openbtn" style="background:var(--sup);cursor:default">⚠ Source file not available</div>
+           ${d.gapReason?`<div class="gapwhy">Why: ${esc(d.gapReason)}.<br>The record is kept so the gap is visible; the file itself is not in the export.</div>`:''}`}
       <div class="sec">Document</div>
       <div class="kv">
         ${kv('Artifact',d.artifact)}${kv('Sub-artifact / title',d.title)}${kv('TMF level',d.level)}
         ${kv('Country',d.country)}${kv('Site / org',d.scope)}${kv('Person',d.person)}
         ${kv('Version',d.version)}${kv('Version state',d.versionState)}${kv('Lifecycle',d.lifecycle)}
+        ${kv('Superseded by',d.supersededBy)}
         ${kv('Restricted',d.restricted?'Yes':'')}${kv('Language',d.language)}${kv('Translation',d.translation)}
         ${kv(d.dateDesc||'Artifact date',d.date)}${kv('Expires',d.expiry)}${kv('Document ID',d.documentId)}
+        ${kv('Last export',d.milestone)}${META.merged?kv('Exported in',msList(d).join('; ')):''}
         ${kv('Size',fmtSize(d.sizeBytes))}
       </div>
       <div class="sec">Files</div>
@@ -1383,7 +2391,11 @@ footer{max-width:820px;margin:8px auto 30px;padding:0 18px;color:#67727f;font-si
 #  MAIN
 # ========================================================================================
 $script:OutputRoot = $null
+$script:LogFallbackDir = $null
 $script:TempDir    = $null      # set as soon as the temp dir exists, so cleanup survives a throw
+$script:Demoted    = 0          # older versions filed under 03 Superseded by version resolution
+$script:Flagged    = 0          # records raised for a human to look at
+$script:Excluded   = 0          # records the reviewer's exclusion list took out of the TMF tree
 $source = $null
 
 # No archive supplied -> show friendly instructions and stop (instead of prompting).
@@ -1392,11 +2404,21 @@ if ([string]::IsNullOrWhiteSpace($ArchivePath)) {
     return
 }
 
+# Where the run log goes if the run dies before there is an output folder - a crash log is the one
+# we most need. Set only once the input is known to exist: a run that fails because the path was
+# wrong has nothing in its log the user did not just read on screen, and writing it would drop a
+# file into whatever directory they happened to be standing in.
+
 try {
-    Write-Log "eTMF Archive Humanizer - parse, classify & humanize" 'STEP'
+    Show-RunHeader -ArchivePath $ArchivePath -BoundParameters $PSBoundParameters
 
     # Resolve where the output will live (sibling of the input by default).
     $inputItem = Get-Item -LiteralPath $ArchivePath
+    # Beside the input, never INSIDE it: for folder input the archive itself is what the user handed
+    # us, and the tool promises not to modify it.
+    $script:LogFallbackDir = if ($inputItem.PSIsContainer) {
+                                 if ($inputItem.Parent) { $inputItem.Parent.FullName } else { $inputItem.FullName }
+                             } else { $inputItem.DirectoryName }
     $baseDir   = if ($inputItem.PSIsContainer) {
                      if ($inputItem.Parent) { $inputItem.Parent.FullName } else { $inputItem.FullName }  # drive/fs root has no parent
                  } else { $inputItem.DirectoryName }
@@ -1432,8 +2454,26 @@ try {
     }
     $events = @($events)
 
+    # Read and validate the exclusion list up front: it must fail fast on a bad path or a missing
+    # column whichever output mode is chosen, and it is applied to every model below.
+    $exclusions = @()
+    if ($ExclusionList) {
+        $exclusions = Import-EtmfExclusions -Path $ExclusionList
+        Write-Log ("Exclusion list: {0} row(s) read from {1}" -f @($exclusions).Count, $ExclusionList) 'INFO'
+    }
+
     if ($DryRun) {
-        Write-Log "DryRun: parsed & classified only; nothing written." 'INFO'
+        # Preview the decisions, not just the parse: a reviewer uses -DryRun to see what WOULD be
+        # merged, superseded, flagged and excluded before committing to an output folder.
+        if (-not $SplitByMilestone -or $events.Count -le 1) {
+            $preview = Merge-EtmfEvents -Events $events
+            $pv = Resolve-EtmfVersions -Model $preview
+            $pf = Set-EtmfReviewFlags -Model $preview
+            $px = if (@($exclusions).Count -gt 0) { Set-EtmfExclusions -Model $preview -Exclusions $exclusions } else { 0 }
+            Write-Log ("DryRun: {0} document(s) after merge ({1} duplicate(s) collapsed); {2} older version(s) would be superseded; {3} flagged for review; {4} excluded." -f `
+                $preview.Documents.Count, $preview.Collapsed, $pv.Demoted, $pf, $px) 'INFO'
+        }
+        Write-Log "DryRun: nothing was written." 'INFO'
         return
     }
 
@@ -1441,19 +2481,28 @@ try {
     $b0 = $events[0].Model.Batch
     $studyName = ConvertTo-SafeName $b0.SpecificationId
     if ([string]::IsNullOrWhiteSpace($studyName)) { $studyName = ConvertTo-SafeName $b0.StudyId }
+    # A final-only copy gets its own default folder name: it must never be mistaken for, or
+    # overwrite, the complete rendering of the same study.
+    $nameTemplate = if ($FinalOnly) { $script:FinalOnlyOutputNameTemplate } else { $script:DefaultOutputNameTemplate }
     $outputRoot = if ($OutputPath) { $OutputPath }
-                  else { Join-Path $baseDir (ConvertTo-SafeName ($script:DefaultOutputNameTemplate -f $studyName)) }
+                  else { Join-Path $baseDir (ConvertTo-SafeName ($nameTemplate -f $studyName)) }
     $script:OutputRoot = $outputRoot
 
     if (Test-Path -LiteralPath $outputRoot) {
         if ($Force) {
             # Safety: only ever auto-delete a directory that looks like our own prior output,
             # so a mistyped -OutputPath + -Force cannot wipe an unrelated folder.
-            $looksLikeOurs = @('index.html', 'inventory.csv', '_log.txt', 'Documents') |
-                Where-Object { Test-Path -LiteralPath (Join-Path $outputRoot $_) }
+            # The run log is dated (_log_<stamp>.txt), so match it by prefix - a run that died after
+            # creating the output root leaves only that file, and an exact '_log.txt' test would
+            # refuse the very re-run the user needs.
+            $looksLikeOurs = @(
+                @('index.html', 'inventory.csv', 'Documents', '_Excluded') |
+                    Where-Object { Test-Path -LiteralPath (Join-Path $outputRoot $_) }
+                @(Get-ChildItem -LiteralPath $outputRoot -Filter '_log_*.txt' -File -ErrorAction SilentlyContinue)
+            )
             if (-not $looksLikeOurs) {
                 throw "Refusing to -Force delete '$outputRoot': it does not look like a previous run's output " +
-                      "(no index.html / inventory.csv / _log.txt / Documents). Remove it manually or choose another -OutputPath."
+                      "(no index.html / inventory.csv / _log_<date>.txt / Documents). Remove it manually or choose another -OutputPath."
             }
             if ($PSCmdlet.ShouldProcess($outputRoot, 'Remove existing output directory')) {
                 Write-Log "Output exists; -Force given, removing: $outputRoot" 'WARN'
@@ -1464,60 +2513,162 @@ try {
         }
     }
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
+    Write-Log "Output folder: $outputRoot" 'INFO'
 
-    # ---- Phases 5 + 6: per event, build tree + inventory + viewer ----
-    $multi      = $events.Count -gt 1
-    $written    = [System.Collections.Generic.List[object]]::new()
-    $usedLabels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # ---- Phases 5 + 6: build tree + inventory + viewer ----
+    # DEFAULT: ONE merged tree across every milestone export. A milestone export is a snapshot of
+    # the whole TMF, so a folder per milestone hands the reader N partial TMFs, N indexes and no
+    # way to search across them - which is exactly the state the archive was already in.
+    # -SplitByMilestone restores the per-snapshot view for anyone who wants it.
+    $written = [System.Collections.Generic.List[object]]::new()
+    $split   = $SplitByMilestone -and $events.Count -gt 1
+    $plan    = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($ev in $events) {
-        $model = $ev.Model; $integrity = $ev.Integrity; $batch = $model.Batch
-
-        $eventLabel = ''
-        $eventDir   = $outputRoot
-        if ($multi) {
-            $eventLabel = ConvertTo-SafeName ("{0} {1}" -f $batch.EventId, $batch.TransferId).Trim()
-            if ([string]::IsNullOrWhiteSpace($eventLabel)) { $eventLabel = ConvertTo-SafeName $batch.TransferId }
-            if (-not $usedLabels.Add($eventLabel)) {                    # two manifests share EventId+TransferId
+    if ($split) {
+        $usedLabels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($ev in $events) {
+            $label = ConvertTo-SafeName $ev.Model.Batch.Milestone
+            if (-not $usedLabels.Add($label)) {                       # two manifests, one label
                 $n = 2
-                while (-not $usedLabels.Add("$eventLabel ($n)")) { $n++ }
-                $eventLabel = "$eventLabel ($n)"
-                Write-Log "Duplicate event label; disambiguated to '$eventLabel'" 'WARN'
+                while (-not $usedLabels.Add("$label ($n)")) { $n++ }
+                $label = "$label ($n)"
+                Write-Log "Duplicate milestone label; disambiguated to '$label'" 'WARN'
             }
-            $eventDir = Join-Path $outputRoot $eventLabel
+            $eventDir = Join-Path $outputRoot $label
             New-Item -ItemType Directory -Path $eventDir -Force | Out-Null
+            $plan.Add([pscustomobject]@{ Model = $ev.Model; Integrity = $ev.Integrity; Dir = $eventDir; Label = $label; Folder = $label })
+        }
+    }
+    else {
+        $merged = Merge-EtmfEvents -Events $events
+        if ($events.Count -gt 1) {
+            Write-Log ("Merged {0} milestone export(s) into one TMF: {1} document(s) after collapsing {2} duplicate(s)." -f `
+                $events.Count, $merged.Documents.Count, $merged.Collapsed) 'OK'
+        }
+        elseif ($merged.Collapsed -gt 0) {
+            # One manifest can still list the same file twice under two OBJECTs.
+            Write-Log ("Collapsed {0} duplicate record(s) pointing at the same file." -f $merged.Collapsed) 'INFO'
+        }
+        # Now that every snapshot is in one model, decide which VERSION of each document is the
+        # current one - the per-snapshot OBJECTVERSIONSTATE cannot know about a later replacement.
+        $resolution = Resolve-EtmfVersions -Model $merged
+        if ($resolution.Demoted -gt 0) {
+            Write-Log ("Version resolution: {0} older version(s) across {1} document(s) moved to '03 Superseded' - a newer version exists in the archive." -f `
+                $resolution.Demoted, $resolution.Groups) 'OK'
         }
 
-        Write-Log ("Humanizing event '{0}' -> {1}" -f $batch.EventId, $eventDir) 'STEP'
-        $result = Invoke-Humanize -Model $model -OutputRoot $eventDir `
-                    -KeepOriginalNames:$KeepOriginalNames -VerifyCopy:(-not $SkipIntegrityCheck)
+        # Integrity was verified per manifest; restate it over the merged set so the viewer's
+        # header counts what this view actually holds rather than one snapshot's worth.
+        $mergedIntegrity = $null
+        if (-not $SkipIntegrityCheck) {
+            $okCount      = @($merged.Documents | Where-Object { $_.IntegrityOk -eq $true }).Count
+            $missingCount = @($merged.Documents | Where-Object { -not $_.FileExists }).Count
+            $mergedIntegrity = [pscustomobject]@{
+                Ok      = $okCount
+                Bad     = ($merged.Documents.Count - $okCount - $missingCount)
+                Missing = $missingCount
+            }
+        }
+        $label = if ($merged.Batch.IsMerged) { "All {0} milestones (merged)" -f @($merged.Batch.Milestones).Count }
+                 else                        { $merged.Batch.Milestone }
+        $plan.Add([pscustomobject]@{ Model = $merged; Integrity = $mergedIntegrity; Dir = $outputRoot; Label = $label; Folder = '' })
+        $script:Demoted = $resolution.Demoted
+    }
+
+    # Flag what a person should look at (nothing moves), then apply the decisions a person has
+    # already made. BOTH run for every model, in either output mode: a reviewer's written decision
+    # that a document does not belong in this TMF must not depend on which layout was chosen - it
+    # used to be dropped in silence under -SplitByMilestone, publishing the document to the client.
+    foreach ($p in $plan) {
+        $script:Flagged += Set-EtmfReviewFlags -Model $p.Model
+        if (@($exclusions).Count -gt 0) {
+            $script:Excluded += Set-EtmfExclusions -Model $p.Model -Exclusions $exclusions
+        }
+    }
+    if (@($exclusions).Count -gt 0) {
+        foreach ($p in $plan) { Update-EtmfSupersededReferences -Model $p.Model }
+        Write-EtmfExclusionOutcome -Exclusions $exclusions
+        Write-Log ("{0} document(s) excluded from the TMF tree (filed under _Excluded)." -f $script:Excluded) 'OK'
+    }
+    # A flag on a document the reviewer has already excluded is settled: count only what is still
+    # in the tree and still awaiting a decision.
+    $script:Flagged = @($plan | ForEach-Object { $_.Model.Documents } |
+                        Where-Object { $_.ReviewFlag -and -not $_.Excluded }).Count
+    if ($script:Flagged -gt 0) {
+        Write-Log ("{0} document(s) flagged for review (duplicate content and/or a name mentioning another study's code)." -f $script:Flagged) 'WARN'
+    }
+
+    # -FinalOnly: reduce every model to the current approved documents, and remember what that
+    # left out so the copy can state its own scope.
+    $withheld = $null
+    if ($FinalOnly) {
+        foreach ($p in $plan) {
+            $w = Select-EtmfFinalDocuments -Model $p.Model
+            if ($null -eq $withheld) { $withheld = $w }
+            else {
+                foreach ($f in @('Superseded', 'InProgress', 'Excluded', 'NoFile', 'Flagged')) {
+                    $withheld.$f = $withheld.$f + $w.$f
+                }
+            }
+        }
+        $keptTotal = @($plan | ForEach-Object { $_.Model.Documents }).Count
+        Write-Log ("-FinalOnly: keeping {0} current approved document(s); leaving out {1} superseded, {2} in progress, {3} excluded." -f `
+            $keptTotal, $withheld.Superseded, $withheld.InProgress, $withheld.Excluded) 'OK'
+        if ($withheld.Flagged -gt 0) {
+            Write-Log ("{0} document(s) in this copy are flagged for review - they are approved in the eTMF, but the tool could not tell whether they belong to this study. Check them before handing the folder over." -f $withheld.Flagged) 'WARN'
+        }
+    }
+
+    foreach ($p in $plan) {
+        $model = $p.Model; $integrity = $p.Integrity
+
+        Write-Log ("Humanizing '{0}' -> {1}" -f $p.Label, $p.Dir) 'STEP'
+        $result = Invoke-Humanize -Model $model -OutputRoot $p.Dir `
+                    -KeepOriginalNames:$KeepOriginalNames -VerifyCopy:(-not $SkipIntegrityCheck) `
+                    -OmitBucketFolder:$FinalOnly
         Write-Log ("Copied {0} file(s); {1} missing; {2} copy mismatch(es)." -f `
             $result.Copied, $result.Missing, $result.CopyBad) ($(if ($result.CopyBad -eq 0 -and $result.Missing -eq 0) { 'OK' } else { 'WARN' }))
 
-        $invPath = Join-Path $eventDir 'inventory.csv'
+        $invPath = Join-Path $p.Dir 'inventory.csv'
         $result.Inventory | Export-Csv -LiteralPath $invPath -NoTypeInformation -Encoding UTF8
         Write-Log "Inventory written: $invPath" 'OK'
 
-        $indexPath = New-HtmlViewer -Model $model -OutputRoot $eventDir -Integrity $integrity
+        $indexPath = New-HtmlViewer -Model $model -OutputRoot $p.Dir -Integrity $integrity -FinalOnlyCopy:$FinalOnly
         Write-Log "Viewer written: $indexPath" 'OK'
+
+        if ($FinalOnly) {
+            $notePath = Join-Path $p.Dir 'About this folder.txt'
+            Write-EtmfScopeNote -Path $notePath -Batch $model.Batch -Included $model.Documents.Count `
+                -Withheld $withheld -SourceInput $ArchivePath -ExclusionList $ExclusionList
+            Write-Log "Scope note written: $notePath" 'OK'
+        }
 
         $docs = $model.Documents
         $written.Add([pscustomobject]@{
-            Event = $batch.EventId; EventLabel = $eventLabel; Dir = $eventDir; Index = $indexPath
+            Event = $p.Label; EventLabel = $p.Folder; Dir = $p.Dir; Index = $indexPath
             Docs = $docs.Count; Copied = $result.Copied; Missing = $result.Missing; CopyBad = $result.CopyBad
             Final      = @($docs | Where-Object { $_.Bucket -eq '01 Final' }).Count
             InProgress = @($docs | Where-Object { $_.Bucket -eq '02 In Progress' }).Count
             Superseded = @($docs | Where-Object { $_.Bucket -eq '03 Superseded' }).Count
+            Excluded   = @($docs | Where-Object { $_.Excluded }).Count
         })
     }
 
     $landing = $null
-    if ($multi) {
+    if ($split) {
         $landing = New-LandingPage -OutputRoot $outputRoot -Events $written -Study $b0.SpecificationId
         Write-Log "Landing page written: $landing" 'OK'
     }
 
-    Show-Recap -OutputRoot $outputRoot -Written $written -Landing $landing
+    # Gap causes, most frequent first (empty when everything bound).
+    $gaps = @($plan | ForEach-Object { $_.Model.Documents } |
+              Where-Object { -not $_.FileExists } |
+              Group-Object { if ($_.GapReason) { $_.GapReason } else { 'no reason recorded' } } |
+              Sort-Object Count -Descending |
+              ForEach-Object { [pscustomobject]@{ Count = $_.Count; Reason = $_.Name } })
+
+    Show-Recap -OutputRoot $outputRoot -Written $written -Landing $landing -Gaps $gaps `
+               -Demoted $script:Demoted -Flagged $script:Flagged -Excluded $script:Excluded -Withheld $withheld
 
     if ($Open) {
         $toOpen = if ($landing) { $landing } else { $written[0].Index }
@@ -1533,10 +2684,19 @@ catch {
     throw
 }
 finally {
-    # Persist the run log next to the output (if we produced one).
-    if ($script:OutputRoot -and (Test-Path -LiteralPath $script:OutputRoot)) {
-        $logPath = Join-Path $script:OutputRoot '_log.txt'
-        $script:LogLines | Set-Content -LiteralPath $logPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    # Persist the run log. DATED, so re-running never overwrites the record of the previous run, and
+    # so a log that arrives by mail identifies itself. It lands next to the output when there is one,
+    # and beside the input otherwise - a run that failed early is exactly when the log matters most.
+    $logDir = $null
+    if ($script:OutputRoot -and (Test-Path -LiteralPath $script:OutputRoot)) { $logDir = $script:OutputRoot }
+    elseif ($script:LogFallbackDir -and (Test-Path -LiteralPath $script:LogFallbackDir)) { $logDir = $script:LogFallbackDir }
+    if ($logDir) {
+        $logPath = Join-Path $logDir ("_log_{0}.txt" -f $script:RunStamp)
+        try {
+            $script:LogLines | Set-Content -LiteralPath $logPath -Encoding UTF8 -ErrorAction Stop
+            Write-Host ("  Run log       : {0}" -f $logPath) -ForegroundColor Green
+        }
+        catch { Write-Host ("  (could not write the run log to {0}: {1})" -f $logPath, $_.Exception.Message) -ForegroundColor Yellow }
     }
     # Remove the temp extraction (files have been copied out by now). Keyed off $script:TempDir,
     # not $source, so a throw *during* extraction still cleans up rather than leaving clinical
