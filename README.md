@@ -66,8 +66,7 @@ Nothing else to install.
    below). *(Have PowerShell 7? You can write `pwsh` instead of `powershell`.)*
 
 5. When it finishes, it tells you the name of the new folder it created. Open that folder and
-   **double-click `index.html`** to start browsing. *(Add `-Open` to the end of the command to
-   have it open automatically.)*
+   **double-click `index.html`** to start browsing.
 
 If you run the tool **without** giving it a `.zip`, it simply prints these instructions.
 
@@ -107,7 +106,6 @@ A new folder named after your study:
 |---|---|---|
 | Everything in one tree *(default)* | nothing | One folder per artifact holding all its versions. The status is in the file name and in `inventory.csv`. |
 | **Approved documents in the TMF, everything not approved outside it** | `-SeparateNotFinalized` | `Documents/` holds every record whose last lifecycle event is `Finalized` (including an older approved version that a newer one replaced). **`Not finalized/`** holds the rest (`Awaiting review`, `Flagged by QC Comment`, or no lifecycle event), with the same Zone/Section/Artifact structure. |
-| Status folders as well | `-SeparateByStatus` | `01 Finalized`, `02 Not finalized` and `03 Superseded` folders inside each artifact. Works on its own or with `-SeparateNotFinalized`. |
 | **A copy to hand to someone else** | `-FinalOnly` | A separate folder, `<Study> (final documents only)`, with only the latest `Finalized` version of each document. `About this folder.txt` states that it is not the complete TMF. The list of what was left out (`<folder> - withheld.csv`) and the run log are saved **beside** the folder, not in it. |
 
 Example — approved documents in the TMF, the rest outside:
@@ -118,7 +116,7 @@ powershell -ExecutionPolicy Bypass -File .\Convert-EtmfArchive.ps1 -ArchivePath 
 
 With `-SeparateNotFinalized` the complete trial master file is **both folders together**; the tool says so in
 `About this folder.txt`, in `Not finalized/README.txt` and at the end of the run. Nothing is ever deleted.
-`-FinalOnly` ignores the two layout switches.
+`-FinalOnly` ignores `-SeparateNotFinalized`.
 
 ## How statuses are decided
 
@@ -131,10 +129,17 @@ Statuses are the export's own words — the tool does not invent any.
   `Superseded` (with `SupersededBy` naming the version that replaced them); a newer version that is not finalized
   stays `Not finalized`. Viedoc's own version state is kept untouched in `VersionState`, and `VersionResolution`
   explains any case where the tool and the export differ.
+- **The status in a file name** is the record's last status in the export: `Finalized`, `Document locked` (a Finalized
+  record that is locked), `Awaiting review` or `Flagged by QC Comment`. An earlier file version that nothing shows was ever
+  published or finalized is `Unpublished`. The version number in the name (`v1`, `v2`, …) tells the versions apart.
 - **Superseded** means *every version lower than the current one, whatever its own status* (v1–v3 of a document whose
-  v4 is the current approved version), or a version the export itself marks `Superseded` or `Obsolete`. It is kept, and
-  its status shows its own last lifecycle event — `Superseded; Finalized` was approved when it was replaced,
-  `Superseded; Awaiting review` was not. A current version that is not approved is `Not finalized`, not Superseded.
+  v4 is the current approved version), or a version the export itself marks `Superseded` or `Obsolete`. It is not in the
+  file name; the `VersionState`, `SupersededBy` and `Bucket` columns of `inventory.csv` (and the viewer) show it. A current
+  version that is not approved is `Not finalized`, not Superseded.
+- **Earlier file versions.** When a new file is uploaded to a record, Viedoc keeps the earlier file in the export. Only
+  the file that carries the record's `Finalized` event counts as approved; the earlier ones are treated as `Not finalized`
+  (named `[Awaiting review]` if that is what their own history says, otherwise `[Unpublished]`). They go to `Not finalized/`, or are left out of a
+  `-FinalOnly` copy, and the `LifecycleNote` column says why. Signed copies are not affected.
 - **Placement** for `-SeparateNotFinalized` uses each record's own last lifecycle event, not Superseded: an approved v2
   stays in `Documents/` even though v4 replaced it, and a v3 that was never approved goes to `Not finalized/`.
 
@@ -142,16 +147,12 @@ Statuses are the export's own words — the tool does not invent any.
 
 | Option | What it does |
 |---|---|
-| `-ArchivePath` | The eTMF `.zip` (or an already-unzipped export folder). |
+| `-ArchivePath` | The eTMF `.zip`, as exported from Viedoc (do not unzip it). |
 | `-OutputPath` | Where to put the result (default: a new folder next to the `.zip`). |
 | `-SeparateNotFinalized` | Put records that are not finalized in a sibling `Not finalized/` tree. |
-| `-SeparateByStatus` | Add `01 Finalized` / `02 Not finalized` / `03 Superseded` folders inside each artifact. |
 | `-FinalOnly` | A hand-over copy with only the latest Finalized version of each document. |
-| `-SplitByMilestone` | One folder and viewer per milestone, instead of one combined TMF. |
-| `-KeepOriginalNames` | Keep original file names (versions that share a name get ` v<version>`). |
 | `-SkipIntegrityCheck` | Skip the MD5 check (faster, less thorough). |
 | `-Force` | Replace a result folder from a previous run. Only a folder this tool made is replaced, and never one that is or contains the input. |
-| `-Open` | Open the viewer when finished. |
 | `-DryRun` | Show what would happen without creating anything. |
 
 For full help: `Get-Help .\Convert-EtmfArchive.ps1 -Full`
