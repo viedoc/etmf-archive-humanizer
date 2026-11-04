@@ -21,6 +21,12 @@ Your original `.zip` is **never changed** — the tool only creates a new, easy-
   **Windows PowerShell**, which is enough to run this tool. *(It also runs on **PowerShell 7**, and
   on macOS/Linux, if you have those.)*
 - Your **eTMF export `.zip`** from Viedoc.
+- **Free disk space** about the size of the export once unpacked (roughly the size of the `.zip` again).
+  The tool unpacks into your temporary folder and then moves the files into the output folder, so
+  that space is needed on the drive holding the output and, until the files are moved, on the drive
+  holding the temporary folder (usually the same drive). It checks first and stops with a clear
+  message if there is not enough. A very large export (tens of GB) may not open in Windows
+  PowerShell at all; if the tool says so, run it with PowerShell 7 (`pwsh`) instead.
 
 Nothing else to install.
 

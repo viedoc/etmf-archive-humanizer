@@ -119,7 +119,7 @@ $script:EmsNamespace = 'https://tmfrefmodel.com/ems'
 # Stamped into the run log, the viewer and inventory.csv. A support mail that says "it still fails"
 # is unanswerable without it: we could not tell whether a reported log came from the build that
 # contains a given fix. Bump it with any change to behaviour or output.
-$script:ToolVersion  = '2.1.0'
+$script:ToolVersion  = '2.1.2'
 # Characters assumed for the output root when budgeting file names (e.g. C:\Users\name\Documents\Study),
 # and for the tree folder under it ('Documents' or 'Not finalized', the longer one counts).
 $script:PathBudgetRoot = 60
@@ -305,6 +305,63 @@ function Get-ContentUrlTail {
     $parts = @(Get-ContentPathSegments (($segments | Select-Object -Skip 1) -join '/'))
     if ($parts.Count -eq 0 -or ($parts -contains '..')) { return $null }
     return ($parts -join '/')
+}
+
+# The same key with leading/trailing white space (a space, TAB, CR/LF ...) removed from the FILE NAME, the
+# last segment only; $null when there is nothing to remove. Viedoc's archive writer names a zip entry from
+# the file name TRIMMED, but writes the manifest's CONTENTURL from the same name untrimmed, so a document
+# whose stored name begins with a space is listed as 'folder/ name.pdf' and sits in the zip as
+# 'folder/name.pdf' (seen in a real export: 27 of 9,969 documents). Import-EtmfManifest tries this key
+# only after the exact one missed, and binds only when the file's checksum equals the manifest's.
+function Get-EtmfTrimmedNameKey {
+    param([string]$Key)
+    $slash   = $Key.LastIndexOf('/')
+    $name    = $Key.Substring($slash + 1)
+    $trimmed = $name.Trim()
+    if ($trimmed.Length -eq 0 -or $trimmed -ceq $name) { return $null }
+    return $Key.Substring(0, $slash + 1) + $trimmed
+}
+
+# A size for a message a person reads: "20.2 GB", not "21,727,903,744 bytes". Invariant, so the
+# text does not depend on the machine's language.
+function Format-EtmfSize {
+    param([double]$Bytes)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Bytes -ge 1GB) { return ($Bytes / 1GB).ToString('N1', $inv) + ' GB' }
+    if ($Bytes -ge 1MB) { return ($Bytes / 1MB).ToString('N0', $inv) + ' MB' }
+    return ([Math]::Ceiling($Bytes / 1KB)).ToString('N0', $inv) + ' KB'
+}
+
+# Free bytes on the volume that holds $Path, or $null when that cannot be told (a network share, a
+# volume the platform will not report). $null means "not checked", never "no space": a check that
+# cannot measure must not refuse a run.
+function Get-EtmfFreeBytes {
+    param([string]$Path)
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+            $root = [System.IO.Path]::GetPathRoot($full)
+            if ($root -notmatch '^[A-Za-z]:\\') { return $null }        # UNC share
+            return [long]([System.IO.DriveInfo]::new($root)).AvailableFreeSpace
+        }
+        # Elsewhere the volume is found from the path itself, which must exist: walk up to what does.
+        $probe = $full
+        while ($probe -and -not (Test-Path -LiteralPath $probe)) { $probe = [System.IO.Path]::GetDirectoryName($probe) }
+        if (-not $probe) { return $null }
+        return [long]([System.IO.DriveInfo]::new($probe)).AvailableFreeSpace
+    }
+    catch { return $null }
+}
+
+# Would $Bytes fit on the volume holding $Path? Returns $null when that is not known; otherwise
+# Free, Need (the bytes plus headroom for the inventory, the viewer, the log and the filesystem's own
+# overhead) and Short ($true when it does not fit).
+function Get-EtmfSpaceCheck {
+    param([string]$Path, [double]$Bytes)
+    $free = Get-EtmfFreeBytes $Path
+    if ($null -eq $free) { return $null }
+    $need = $Bytes + 256MB
+    return [pscustomobject]@{ Free = $free; Need = $need; Short = ($free -lt $need) }
 }
 
 # Base64-encoded MD5 of a file (matches the EMS INTEGRITY encoding).
@@ -774,8 +831,27 @@ function Expand-EtmfZip {
     $skipped = 0; $count = 0
 
     $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $entryTotal = 0
     try {
+        # Say so BEFORE the extraction if the temp drive cannot hold it: a 20 GB export that fills the disk
+        # fails twenty minutes in, with an error ("out of memory", "disk full") that names no cause.
+        $unpacked = 0L
+        foreach ($entry in $zip.Entries) { $unpacked += $entry.Length }
+        # Deflate cannot shrink data more than about 1000:1. A total far beyond that is a table of contents .NET
+        # misread (the same thing that gives a 5.1 read of some zips no entries at all), not a size to refuse on.
+        $space = $null
+        if ($unpacked -le ((Get-Item -LiteralPath $ZipPath).Length * 1100)) { $space = Get-EtmfSpaceCheck -Path $Destination -Bytes $unpacked }
+        else { Write-Log "The sizes this zip lists add up to an implausible total, so the free-space check is skipped." 'WARN' }
+        if ($null -ne $space) {
+            $driveName = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Destination))
+            Write-Log ("Unpacking needs about {0} of temporary space on {1}; {2} is free." -f (Format-EtmfSize $unpacked), $driveName, (Format-EtmfSize $space.Free)) 'INFO'
+            if ($space.Short) {
+                throw ("Not enough free space on {0} to unpack this archive: it unpacks to about {1} in the temporary folder, and {2} is free. " -f $driveName, (Format-EtmfSize $unpacked), (Format-EtmfSize $space.Free)) +
+                      'Free up space there, or point the temporary folder at a drive with room before running again (in PowerShell, after creating the folder: $env:TEMP = ''D:\tmp''; $env:TMP = $env:TEMP).'
+            }
+        }
         foreach ($entry in $zip.Entries) {
+            $entryTotal++                   # every entry .NET could read, directories and manifests included (counted here: @($empty).Count is 1 and $empty.Count throws under StrictMode)
             if ([string]::IsNullOrEmpty($entry.Name)) { continue }        # directory entry
             $parts = @(Get-ContentPathSegments $entry.FullName)
             if ($parts.Count -eq 0) { continue }
@@ -851,7 +927,7 @@ function Expand-EtmfZip {
     if ($skipped -gt 0) {
         Write-Log "$skipped zip entr(ies) could not be extracted - they will show as missing source files." 'WARN'
     }
-    return [pscustomobject]@{ FileCount = $files.Count; Skipped = $skipped; Files = $files; Manifests = $manifests }
+    return [pscustomobject]@{ FileCount = $files.Count; EntryCount = $entryTotal; Skipped = $skipped; Files = $files; Manifests = $manifests }
 }
 
 function Resolve-EtmfSource {
@@ -869,6 +945,29 @@ function Resolve-EtmfSource {
         Write-Log "Extracting archive to temp: $temp" 'STEP'                # even if extraction throws
         $x = Expand-EtmfZip -ZipPath $item.FullName -Destination $temp
         Write-Log "Extracted $($x.FileCount) file(s)" 'INFO'
+        if ($x.FileCount -eq 0) {
+            # Nothing to convert, so stop here and say why rather than fall through to "no manifest found",
+            # which reads as a defect in the export. A zip that opens but yields no entries at all is what
+            # .NET does with a table of contents it cannot follow (seen in a real 20 GB export read by Windows
+            # PowerShell 5.1, which PowerShell 7 read fine); no code of ours drops an entry silently.
+            $zipBytes = $item.Length
+            if ($x.Manifests.Count -eq 0) {
+                # Not a single file, manifest or document. How many entries .NET did find is worth saying: a damaged
+                # table of contents can yield none, or a bogus one whose name is empty.
+                $why = ("No files could be read from '{0}' ({1} bytes): this PowerShell found {2} entr{3} in it and none is a file. " -f `
+                    $item.Name, $zipBytes.ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture), $x.EntryCount, $(if ($x.EntryCount -eq 1) { 'y' } else { 'ies' }))
+                if ($PSVersionTable.PSVersion.Major -lt 6) {
+                    $why += ("This is Windows PowerShell {0}; it cannot read some large zips that PowerShell 7 reads. Run the script with PowerShell 7 (pwsh). If PowerShell 7 reads nothing either, the zip is incomplete or damaged: download or export it again." -f $PSVersionTable.PSVersion)
+                }
+                else {
+                    $why += 'The zip is incomplete or damaged (for example a partial download or a copy that was cut short): download or export it again.'
+                }
+            }
+            else {
+                $why = ("'{0}' holds {1} manifest file(s) but no documents, so there is nothing to convert. Check that this is the complete export zip." -f $item.Name, $x.Manifests.Count)
+            }
+            throw $why
+        }
         # Manifests come from the extractor, not from a directory scan: their temp names are
         # neutral, and each carries the archive prefix its CONTENTURLs are relative to.
         return [pscustomobject]@{ ContentMap = $x.Files; Manifests = $x.Manifests }
@@ -1202,6 +1301,7 @@ function Import-EtmfManifest {
             # are distinguishable at the point of failure, so record which one it was.
             $gapReason = ''
             $lookupKey = ''
+            $bindNote  = ''     # set when the file was bound by the trimmed-name second chance (a Note in the inventory)
 
             # We extracted this archive, so the index knows exactly which file this record is. The key
             # is the entry's VERBATIM archive path, so nothing is derived - there is nothing to collide
@@ -1217,9 +1317,43 @@ function Import-EtmfManifest {
                 $lookupKey = $key
                 $mapped = $null
                 $found = $ContentMap.TryGetValue($key, [ref]$mapped)
+                $nearMiss = ''
+                if (-not $found) {
+                    # One narrow second chance, never a guess: the export's CONTENTURL may keep white space
+                    # at the start of the file name that the zip entry has lost (see Get-EtmfTrimmedNameKey).
+                    # Used only when exactly that one entry exists AND its bytes hash to the manifest's
+                    # checksum - measured here, whatever -SkipIntegrityCheck says.
+                    $trimKey = Get-EtmfTrimmedNameKey $key
+                    if ($null -ne $trimKey) {
+                        $trimMapped = $null
+                        if (-not $ContentMap.TryGetValue($trimKey, [ref]$trimMapped)) { }      # no such entry: nothing to say
+                        elseif ([string]::IsNullOrEmpty($trimMapped)) {
+                            $nearMiss = 'an entry with this name without its leading/trailing white space exists, but two entries share that path, so it was not used'
+                        }
+                        elseif (-not (Test-Path -LiteralPath $trimMapped -PathType Leaf)) {
+                            $nearMiss = 'an entry with this name without its leading/trailing white space exists, but it could not be extracted, so it was not used'
+                        }
+                        else {
+                            $trimOk = $false
+                            try { $trimOk = (-not [string]::IsNullOrWhiteSpace($integrity)) -and ((Get-FileMd5Base64 $trimMapped) -ceq $integrity) } catch { $trimOk = $false }
+                            if ($trimOk) {
+                                $found    = $true
+                                $mapped   = $trimMapped
+                                $key      = $trimKey
+                                $lookupKey = $trimKey
+                                $bindNote = 'The export lists this file name with leading white space that the zip entry does not have; matched without it, and the checksum equals the manifest''s'
+                                Write-Log ("'{0}': {1}." -f (Get-NodeText $file 'FILENAME'), $bindNote) 'INFO'
+                            }
+                            else {
+                                $nearMiss = 'an entry with this name without its leading/trailing white space exists, but its checksum is not the manifest''s (or none is stated), so it was not used'
+                            }
+                        }
+                    }
+                }
                 if ($found) { [void]$script:Reconcile.Referenced.Add($key) }   # for the reconciliation
                 if (-not $found) {
                     $gapReason = 'the archive contains no entry with this exact path'
+                    if ($nearMiss) { $gapReason += '; ' + $nearMiss }
                 }
                 elseif ([string]::IsNullOrEmpty($mapped)) {
                     $gapReason = 'two or more archive entries share this exact path, so neither can be identified'
@@ -1280,6 +1414,7 @@ function Import-EtmfManifest {
                 FileExists     = $exists
                 GapReason      = $gapReason   # why it could not be bound (empty when it was)
                 LookupKey      = $lookupKey   # the exact path/key we looked for
+                BindNote       = $bindNote    # how the file was found, when not by the exact path
                 SizeBytes      = if ($exists) { (Get-Item -LiteralPath $diskPath).Length } else { $null }      # no file, no size
                 IntegrityOk    = $null   # filled by integrity pass (source)
                 AuditTrail     = $auditTrail
@@ -1378,6 +1513,7 @@ function Merge-EtmfEvents {
                         $d.IntegrityOk = $true
                         $d.SizeBytes   = $prev.SizeBytes
                         $d.LookupKey   = $prev.LookupKey
+                        $d.BindNote    = $prev.BindNote
                         $d.GapReason   = ''
                         Write-Log ("'{0}' has no usable file in '{1}'; using the verified identical bytes exported in '{2}'." -f `
                             $d.OriginalName, $label, $prev.Milestone) 'INFO'
@@ -1742,6 +1878,24 @@ function Get-HumanFileName {
     return (ConvertTo-SafeName ($stem + $suffix)) + $ext
 }
 
+# How many bytes the output will add on its volume. Several records can share ONE extracted file (every
+# version of a document has the same file); each record still gets its own output file. When the
+# extracted files are moved rather than copied AND sit on the output's volume, a move is a rename and
+# costs nothing, so only the extra copies for shared files count; otherwise every file is written in full.
+function Get-EtmfOutputBytes {
+    param($Documents, [bool]$MovesAreFree)
+    $total  = 0L
+    $unique = 0L
+    $seen   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($d in $Documents) {
+        if (-not $d.FileExists -or $null -eq $d.SizeBytes) { continue }
+        $total += [long]$d.SizeBytes
+        if ($seen.Add([string]$d.DiskPath)) { $unique += [long]$d.SizeBytes }
+    }
+    if ($MovesAreFree) { return ($total - $unique) }
+    return $total
+}
+
 # Copy every document into  <out>/Documents/<Zone>/<Section>/<Artifact>/<Scope>/<file>,
 # re-verify each copy, and return the inventory rows. One opt-in layout:
 #   -SeparateNotFinalized  records whose last lifecycle event is not Finalized go to a sibling tree,
@@ -1753,7 +1907,10 @@ function Invoke-Humanize {
         $Model,
         [string]$OutputRoot,
         [switch]$VerifyCopy,
-        [switch]$SeparateNotFinalized
+        [switch]$SeparateNotFinalized,
+        # The source files are the run's own temporary extraction, deleted afterwards: move each one into
+        # the tree instead of copying it, so the output does not need a second copy's worth of disk.
+        [switch]$MoveSources
     )
     # A trailing separator would make the root look one character longer than it is, and the file
     # names are budgeted from the root's length, so the same export would get different names.
@@ -1765,6 +1922,17 @@ function Invoke-Humanize {
     $used      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $nextSuffix = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     $inventory = [System.Collections.Generic.List[object]]::new()
+    # A source file shared by several records (every version of a document has the same file) is copied for
+    # all but the LAST record that uses it, and moved for that one. Counted up front, so "last" is known.
+    $usesLeft = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($MoveSources) {
+        foreach ($u in $Model.Documents) {
+            if ($u.FileExists -and $u.DiskPath) {
+                if ($usesLeft.ContainsKey($u.DiskPath)) { $usesLeft[$u.DiskPath] = $usesLeft[$u.DiskPath] + 1 } else { $usesLeft[$u.DiskPath] = 1 }
+            }
+        }
+    }
+    $moved = 0
     $copied = 0; $missing = 0; $copyBad = 0; $shortened = 0; $tooLong = 0; $writeFailed = 0
     $targetMaxPath = 250   # keep generated full paths comfortably under the Windows MAX_PATH (260)
 
@@ -1773,10 +1941,18 @@ function Invoke-Humanize {
         # snapshots, so the model's batch is not the one this CONTENTURL was written against.
         $pp   = Get-ContentPathParts $d.ContentUrl $d.TransferId
         $note = ''
+        # Count this record off its source file NOW, before anything below can throw, so a record that
+        # fails early does not keep the file from moving with the last record that uses it.
+        $lastUse = $false
+        if ($MoveSources -and $d.FileExists -and $d.DiskPath -and $usesLeft.ContainsKey($d.DiskPath)) {
+            $usesLeft[$d.DiskPath] = $usesLeft[$d.DiskPath] - 1
+            $lastUse = ($usesLeft[$d.DiskPath] -le 0)
+        }
         $d.Placement = ''      # set only once the file is actually written there
         $intendedPlacement = if ($SeparateNotFinalized -and $d.Lifecycle -cne 'Finalized') { 'Not finalized' } else { 'Documents' }
 
         if ($d.FileExists) {
+            $note = $d.BindNote      # empty unless the file was found by the trimmed-name second chance
           try {
             # The folder segments below the output root: Zone / Section / Artifact [/ Country / Site].
             $segments = @(
@@ -1816,14 +1992,18 @@ function Invoke-Humanize {
             [void]$used.Add($dest)
             if ($dest.Length -ge 260) { $tooLong++ }
 
-            Copy-Item -LiteralPath $d.DiskPath -Destination $dest -Force
+            # Move only on the last use of the file; if that record is the one that fails, the file is copied for
+            # the others and simply stays in temp (the safe direction).
+            $moveNow = ($MoveSources -and $lastUse)
+            if ($moveNow) { Move-Item -LiteralPath $d.DiskPath -Destination $dest -Force; $moved++ }
+            else          { Copy-Item -LiteralPath $d.DiskPath -Destination $dest -Force }
             $copyOk = $null
             if ($VerifyCopy) {
                 if (-not [string]::IsNullOrWhiteSpace($d.Integrity)) {
                     $copyOk = ((Get-FileMd5Base64 $dest) -ceq $d.Integrity)   # base64 is case-sensitive
                     # Name the file we actually WROTE: the collision guard above may have suffixed it,
                     # and a QA reviewer reconciling the log against the tree must land on the real one.
-                    if (-not $copyOk) { $copyBad++; Write-Log "Copy integrity MISMATCH: $(Split-Path $dest -Leaf)" 'WARN' }
+                    if (-not $copyOk) { $copyBad++; Write-Log "Checksum MISMATCH after writing: $(Split-Path $dest -Leaf)" 'WARN' }
                 }   # no checksum stated: nothing to compare against, so the copy stays unverified (empty), not a mismatch
             }
             $copied++
@@ -1910,6 +2090,11 @@ function Invoke-Humanize {
         })
     }
 
+    if ($moved -gt 0) {
+        $sharedCopies = $copied - $moved
+        $tail = if ($sharedCopies -gt 0) { " (a further $sharedCopies copied: records that share a file get a copy each, and the last one moves it)" } else { '' }
+        Write-Log ("{0} file(s) were moved out of the temporary folder instead of copied{1}." -f $moved, $tail) 'INFO'
+    }
     if ($tooLong -gt 0) {
         Write-Log ("{0} file(s) have a full path of 260 characters or more, which Windows Explorer and many programs cannot open. Choose a shorter -OutputPath (the file names themselves were not changed for this)." -f $tooLong) 'WARN'
     }
@@ -1919,7 +2104,7 @@ function Invoke-Humanize {
 
     return [pscustomobject]@{
         Inventory = $inventory; TreeRoot = $treeRoot
-        Copied = $copied; Missing = $missing; CopyBad = $copyBad; WriteFailed = $writeFailed
+        Copied = $copied; Moved = $moved; Missing = $missing; CopyBad = $copyBad; WriteFailed = $writeFailed
     }
 }
 
@@ -2486,10 +2671,10 @@ function Show-Recap {
     $flag = if ($problems -gt 0) { '  [!]' } else { '' }
     $col  = if ($flag) { 'Yellow' } else { 'Gray' }
     # The counts must add up to the total, or the reader is left hunting for the difference.
-    Write-Out ("    {0,-30} {1,3} files  ({2} finalized / {3} not finalized / {4} superseded)  copied {5}{6}" -f `
+    Write-Out ("    {0,-30} {1,3} files  ({2} finalized / {3} not finalized / {4} superseded)  written {5}{6}" -f `
         $e.Event, $e.Docs, $e.Final, $e.InProgress, $e.Superseded, $e.Copied, $flag) -ForegroundColor $col
     if ($e.Missing -gt 0) { Write-Out ("           {0} document(s) missing source files" -f $e.Missing) -ForegroundColor Yellow }
-    if ($e.CopyBad -gt 0) { Write-Out ("           {0} copy integrity mismatch(es)" -f $e.CopyBad) -ForegroundColor Yellow }
+    if ($e.CopyBad -gt 0) { Write-Out ("           {0} checksum mismatch(es) after writing" -f $e.CopyBad) -ForegroundColor Yellow }
     if ($e.IntegrityBad -gt 0) { Write-Out ("           {0} source file(s) do not match the checksum in the manifest" -f $e.IntegrityBad) -ForegroundColor Yellow }
     if ($e.WriteFailed -gt 0) { Write-Out ("           {0} file(s) could not be written" -f $e.WriteFailed) -ForegroundColor Yellow }
     # The headline answer to "which one is the current approved version?".
@@ -3075,6 +3260,7 @@ try {
         throw "The output folder '$targetRoot' is, or contains, the input '$($inputItem.FullName)'. Choose an -OutputPath that is separate from the input."
     }
 
+    $replaceExisting = $false
     if (Test-Path -LiteralPath $targetRoot) {
         if ($Force) {
             # Safety: only ever auto-delete a directory this tool made. Every run writes a marker file
@@ -3109,18 +3295,11 @@ try {
                 }
             }
             finally { Remove-Item -LiteralPath $canaryPath -Force -ErrorAction SilentlyContinue }
-            Write-Log "Output exists; -Force given, removing: $targetRoot" 'WARN'
-            Remove-Item -LiteralPath $targetRoot -Recurse -Force
+            $replaceExisting = $true        # removed further down, once it is known the new output fits
         } else {
             throw "Output folder already exists: $targetRoot  (use -Force to overwrite)"
         }
     }
-    New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
-    $script:OutputRoot = $targetRoot       # (a different name on purpose: PowerShell variable names are case-insensitive, so $outputRoot WOULD BE $script:OutputRoot) only now: a folder this run did not make must never receive its log
-    Set-Content -LiteralPath (Join-Path $targetRoot $script:OutputMarkerName) -Encoding UTF8 -Value @(
-        "Created by eTMF Archive Humanizer v$($script:ToolVersion) on $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)).",
-        'This marker lets -Force recognise the folder as output of this tool. Do not delete it unless you want -Force to refuse this folder.')
-    Write-Log "Output folder: $targetRoot" 'INFO'
 
     # ---- Phases 5 + 6: build tree + inventory + viewer ----
     # ONE merged tree across every milestone export. A milestone export is a snapshot of the whole
@@ -3159,15 +3338,10 @@ try {
         $handOverParent = Split-Path $targetRoot -Parent
         $withheldPath = if ($handOverParent) { Join-Path $handOverParent ('{0} - withheld.csv' -f (Split-Path $targetRoot -Leaf)) }
                         else { Join-Path $targetRoot 'withheld.csv' }
-        if (Test-Path -LiteralPath $withheldPath -PathType Leaf) { Remove-Item -LiteralPath $withheldPath -Force }
+        # (the earlier list is removed and the new one written further down, after the space check: a run that
+        # cannot fit must leave the earlier hand-over folder AND its list as they were)
         # the viewer's integrity tile must count the documents this copy holds, not the ones it left out
         if ($null -ne $integrity) { $integrity = Get-EtmfIntegritySummary $model.Documents }
-        if (@($withheld.Items).Count -gt 0) {
-            # Beside the hand-over folder, not inside it: the recipient gets the folder, and this list
-            # names the (unapproved) documents that were left out of it.
-            Write-EtmfCsv -Path $withheldPath -Rows @($withheld.Items)
-            Write-Log ("Left-out documents itemised in: {0}" -f $withheldPath) 'OK'
-        }
         Write-Log ("-FinalOnly: keeping {0} document(s) whose latest version is Finalized; leaving out {1} superseded and {2} not Finalized (itemised in withheld.csv)." -f `
             $model.Documents.Count, $withheld.Superseded, $withheld.InProgress) 'OK'
         if ($withheld.NewerPending -gt 0) {
@@ -3175,12 +3349,66 @@ try {
         }
     }
 
+    # The extracted files are moved into the tree rather than copied (see Invoke-Humanize), so on the volume
+    # that holds the temp folder a run adds only the copies that shared files need; on another volume the
+    # whole output is written there. Say so now if it will not fit, not after the disk fills up halfway - and
+    # before an earlier output is removed for -Force, so a run that cannot succeed leaves it alone.
+    $tempVolume   = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($script:TempDir))
+    $outputVolume = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($targetRoot))
+    # Same volume = a move is a rename. Windows: drive letters. Elsewhere every path has the root '/', which proves
+    # nothing, and there is no portable device id to ask for - so the volumes are assumed to be the same. That is the
+    # LOWER bound on what the output needs: this check may miss a shortfall (as before it existed) but never refuses a
+    # run that would have fitted, which is the one thing it must not do.
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        $sameVolume = [string]::Equals($tempVolume, $outputVolume, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    else { $sameVolume = $true }
+    $outputBytes  = Get-EtmfOutputBytes -Documents $model.Documents -MovesAreFree $sameVolume
+    $outputSpace  = Get-EtmfSpaceCheck -Path $targetRoot -Bytes $outputBytes
+    $reclaimed    = 0L
+    if ($null -ne $outputSpace -and $outputSpace.Short -and $replaceExisting) {
+        # The folder about to be replaced gives its space back, so count it before refusing.
+        $reclaimed = [long](Get-ChildItem -LiteralPath $targetRoot -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        $outputSpace.Short = (($outputSpace.Free + $reclaimed) -lt $outputSpace.Need)
+    }
+    if ($null -ne $outputSpace) {
+        $credit = if ($reclaimed -gt 0) { " (plus {0} that the folder being replaced gives back)" -f (Format-EtmfSize $reclaimed) } else { '' }
+        Write-Log ("The output adds about {0} on {1}; {2} is free{3}." -f (Format-EtmfSize $outputBytes), $outputVolume, (Format-EtmfSize $outputSpace.Free), $credit) 'INFO'
+        if ($outputSpace.Short) {
+            throw ("Not enough free space on {0} for the output folder: about {1} will be written there, and {2} is free{3}. Choose an -OutputPath on a drive with more room, or free up space." -f `
+                $outputVolume, (Format-EtmfSize $outputBytes), (Format-EtmfSize $outputSpace.Free), $credit)
+        }
+    }
+
+    if ($replaceExisting) {
+        Write-Log "Output exists; -Force given, removing: $targetRoot" 'WARN'
+        Remove-Item -LiteralPath $targetRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
+    $script:OutputRoot = $targetRoot       # (a different name on purpose: PowerShell variable names are case-insensitive, so $outputRoot WOULD BE $script:OutputRoot) only now: a folder this run did not make must never receive its log
+    Set-Content -LiteralPath (Join-Path $targetRoot $script:OutputMarkerName) -Encoding UTF8 -Value @(
+        "Created by eTMF Archive Humanizer v$($script:ToolVersion) on $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)).",
+        'This marker lets -Force recognise the folder as output of this tool. Do not delete it unless you want -Force to refuse this folder.')
+    Write-Log "Output folder: $targetRoot" 'INFO'
+
+    if ($FinalOnly) {
+        # A list left by an earlier run beside this folder would describe other documents.
+        if (Test-Path -LiteralPath $withheldPath -PathType Leaf) { Remove-Item -LiteralPath $withheldPath -Force }
+        if (@($withheld.Items).Count -gt 0) {
+            # Beside the hand-over folder, not inside it: the recipient gets the folder, and this list
+            # names the (unapproved) documents that were left out of it.
+            Write-EtmfCsv -Path $withheldPath -Rows @($withheld.Items)
+            Write-Log ("Left-out documents itemised in: {0}" -f $withheldPath) 'OK'
+        }
+    }
+
     Write-Log ("Humanizing '{0}' -> {1}" -f $label, $targetRoot) 'STEP'
     $result = Invoke-Humanize -Model $model -OutputRoot $targetRoot `
                 -VerifyCopy:(-not $SkipIntegrityCheck) `
-                -SeparateNotFinalized:$sepNotFinalized
+                -SeparateNotFinalized:$sepNotFinalized `
+                -MoveSources
     Write-EtmfActiveContentWarning -Documents $model.Documents
-    Write-Log ("Copied {0} file(s); {1} missing; {2} copy mismatch(es)." -f `
+    Write-Log ("Wrote {0} file(s) into the output; {1} missing; {2} checksum mismatch(es) after writing." -f `
         $result.Copied, $result.Missing, $result.CopyBad) ($(if ($result.CopyBad -eq 0 -and $result.Missing -eq 0 -and $result.WriteFailed -eq 0) { 'OK' } else { 'WARN' }))
     if ($result.WriteFailed -gt 0) { Write-Log ("{0} file(s) could not be written (see the warnings above); their rows are in inventory.csv with the reason in Note." -f $result.WriteFailed) 'WARN' }
 
@@ -3259,7 +3487,7 @@ finally {
         }
         catch { Write-Host ("  (could not write the run log to {0}: {1})" -f $logPath, $_.Exception.Message) -ForegroundColor Yellow }
     }
-    # Remove the temp extraction (files have been copied out by now). Keyed off $script:TempDir,
+    # Remove the temp extraction (every file that was written has been moved or copied out of it by now). Keyed off $script:TempDir,
     # not $source, so a throw *during* extraction still cleans up rather than leaving clinical
     # documents behind in the temp folder.
     if ($script:TempDir -and (Test-Path -LiteralPath $script:TempDir)) {
